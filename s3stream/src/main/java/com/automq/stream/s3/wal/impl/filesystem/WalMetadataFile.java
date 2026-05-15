@@ -21,6 +21,7 @@ package com.automq.stream.s3.wal.impl.filesystem;
 
 import com.automq.stream.s3.ByteBufAlloc;
 import com.automq.stream.s3.wal.exception.UnmarshalException;
+import com.automq.stream.s3.wal.util.WALUtil;
 
 import io.netty.buffer.ByteBuf;
 
@@ -38,6 +39,9 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public class WalMetadataFile {
     public static final String FILE_NAME = "wal.meta";
+    private static final int HEADER_SLOT_COUNT = 2;
+    private static final int HEADER_SLOT_CAPACITY = WALUtil.BLOCK_SIZE;
+    private static final int FILE_CAPACITY = HEADER_SLOT_CAPACITY * HEADER_SLOT_COUNT;
 
     private final File file;
     private final AtomicLong writeRoundTimes = new AtomicLong(0);
@@ -68,8 +72,8 @@ public class WalMetadataFile {
             }
         }
         raf = new RandomAccessFile(file, "rw");
-        if (raf.length() < FilesystemWALService.WAL_HEADER_TOTAL_CAPACITY) {
-            raf.setLength(FilesystemWALService.WAL_HEADER_TOTAL_CAPACITY);
+        if (raf.length() < FILE_CAPACITY) {
+            raf.setLength(FILE_CAPACITY);
         }
         fileChannel = raf.getChannel();
     }
@@ -97,10 +101,10 @@ public class WalMetadataFile {
     public FilesystemWALHeader readLatestHeader() throws IOException {
         ensureOpen();
         FilesystemWALHeader latest = null;
-        for (int i = 0; i < FilesystemWALService.WAL_HEADER_COUNT; i++) {
+        for (int i = 0; i < HEADER_SLOT_COUNT; i++) {
             ByteBuf buf = ByteBufAlloc.byteBuffer(FilesystemWALHeader.WAL_HEADER_SIZE);
             try {
-                long position = (long) i * FilesystemWALService.WAL_HEADER_CAPACITY;
+                long position = (long) i * HEADER_SLOT_CAPACITY;
                 int total = 0;
                 while (total < FilesystemWALHeader.WAL_HEADER_SIZE) {
                     int read = buf.writeBytes(fileChannel, position + total,
@@ -128,8 +132,7 @@ public class WalMetadataFile {
 
     public synchronized void writeHeader(FilesystemWALHeader header) throws IOException {
         ensureOpen();
-        long position = writeRoundTimes.getAndIncrement() % FilesystemWALService.WAL_HEADER_COUNT
-            * FilesystemWALService.WAL_HEADER_CAPACITY;
+        long position = writeRoundTimes.getAndIncrement() % HEADER_SLOT_COUNT * HEADER_SLOT_CAPACITY;
         header.setLastWriteTimestamp(System.nanoTime());
         long trimOffset = header.getTrimOffset();
         ByteBuf buf = header.marshal();

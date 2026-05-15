@@ -20,6 +20,7 @@
 package com.automq.stream.s3.wal.benchmark;
 
 import com.automq.stream.s3.ByteBufAlloc;
+import com.automq.stream.s3.wal.exception.RuntimeIOException;
 import com.automq.stream.s3.wal.impl.block.BlockWALService;
 import com.automq.stream.s3.wal.util.WALChannel;
 
@@ -30,6 +31,10 @@ import net.sourceforge.argparse4j.internal.HelpScreenException;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Comparator;
+import java.util.stream.Stream;
 
 import io.netty.buffer.ByteBuf;
 
@@ -48,6 +53,51 @@ public class BenchTool {
             System.exit(1);
         }
         return ns;
+    }
+
+    /**
+     * Prepare on-disk state before a benchmark run, according to the WAL kind.
+     * <p>
+     * {@link WalBenchmarkKind#BLOCK}: same as {@link #resetWALHeader(String)} (single file or block device).<br>
+     * {@link WalBenchmarkKind#FILESYSTEM}: remove any previous WAL directory (or file at the path) and recreate an empty directory.
+     */
+    public static void prepareWalPath(WalBenchmarkKind kind, String path) throws IOException {
+        switch (kind) {
+            case BLOCK:
+                resetWALHeader(path);
+                break;
+            case FILESYSTEM:
+                if (isBlockDevice(path)) {
+                    throw new IOException("Filesystem WAL benchmarks expect a directory path, not a block device: " + path);
+                }
+                resetFilesystemWalDirectory(path);
+                break;
+            default:
+                throw new IllegalStateException("Unhandled WAL kind: " + kind);
+        }
+    }
+
+    private static void resetFilesystemWalDirectory(String path) throws IOException {
+        System.out.println("Resetting filesystem WAL directory: " + path);
+        Path root = Path.of(path);
+        if (Files.exists(root)) {
+            if (Files.isRegularFile(root)) {
+                Files.delete(root);
+            } else if (Files.isDirectory(root)) {
+                try (Stream<Path> walk = Files.walk(root)) {
+                    walk.sorted(Comparator.reverseOrder()).forEach(p -> {
+                        try {
+                            Files.deleteIfExists(p);
+                        } catch (IOException e) {
+                            throw new RuntimeIOException(e);
+                        }
+                    });
+                }
+            } else {
+                throw new IOException("Path exists but is neither a regular file nor a directory: " + root);
+            }
+        }
+        Files.createDirectories(root);
     }
 
     public static void resetWALHeader(String path) throws IOException {

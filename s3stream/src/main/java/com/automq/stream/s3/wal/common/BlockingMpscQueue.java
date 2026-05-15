@@ -16,12 +16,14 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.bookkeeper.common.collections;
+package com.automq.stream.s3.wal.common;
+
+
+import io.netty.util.internal.shaded.org.jctools.queues.MpscArrayQueue;
 
 import java.util.Collection;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
-import org.jctools.queues.MpscArrayQueue;
 
 /**
  * Blocking queue optimized for multiple producers and single consumer.

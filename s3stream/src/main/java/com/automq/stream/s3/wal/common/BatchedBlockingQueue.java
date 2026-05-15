@@ -18,7 +18,7 @@
  * under the License.
  *
  */
-package org.apache.bookkeeper.common.collections;
+package com.automq.stream.s3.wal.common;
 
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;

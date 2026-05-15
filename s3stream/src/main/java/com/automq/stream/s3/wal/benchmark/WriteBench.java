@@ -23,6 +23,7 @@ import com.automq.stream.s3.wal.AppendResult;
 import com.automq.stream.s3.wal.WriteAheadLog;
 import com.automq.stream.s3.wal.exception.OverCapacityException;
 import com.automq.stream.s3.wal.impl.block.BlockWALService;
+import com.automq.stream.s3.wal.impl.filesystem.FilesystemWALService;
 import com.automq.stream.utils.ThreadUtils;
 import com.automq.stream.utils.Threads;
 
@@ -46,10 +47,11 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 
 import static com.automq.stream.s3.wal.benchmark.BenchTool.parseArgs;
-import static com.automq.stream.s3.wal.benchmark.BenchTool.resetWALHeader;
+import static com.automq.stream.s3.wal.benchmark.BenchTool.prepareWalPath;
 
 /**
- * WriteBench is a tool for benchmarking write performance of {@link BlockWALService}
+ * WriteBench benchmarks append throughput and latency for a {@link WriteAheadLog} implementation
+ * ({@link BlockWALService} or {@link FilesystemWALService}).
  */
 public class WriteBench implements AutoCloseable {
     private static final int LOG_INTERVAL_SECONDS = 1;
@@ -62,26 +64,39 @@ public class WriteBench implements AutoCloseable {
     private Random random = new Random();
 
     public WriteBench(Config config) throws IOException {
-        BlockWALService.BlockWALServiceBuilder builder = BlockWALService.builder(config.path, config.capacity);
-        if (config.depth != null) {
-            builder.ioThreadNums(config.depth);
+        switch (config.walKind) {
+            case BLOCK:
+                BlockWALService.BlockWALServiceBuilder builder = BlockWALService.builder(config.path, config.capacity);
+                if (config.depth != null) {
+                    builder.ioThreadNums(config.depth);
+                }
+                if (config.iops != null) {
+                    builder.writeRateLimit(config.iops);
+                }
+                if (config.bandwidth != null) {
+                    builder.writeBandwidthLimit(config.bandwidth);
+                }
+                this.log = builder.build();
+                break;
+            case FILESYSTEM:
+                FilesystemWALService.FilesystemWALServiceBuilder fsBuilder = FilesystemWALService.builder(config.path);
+                if (config.segmentRollThresholdBytes != null) {
+                    fsBuilder.segmentRollThresholdBytes(config.segmentRollThresholdBytes);
+                }
+                this.log = fsBuilder.build();
+                break;
+            default:
+                throw new IllegalStateException("Unhandled WAL kind: " + config.walKind);
         }
-        if (config.iops != null) {
-            builder.writeRateLimit(config.iops);
-        }
-        if (config.bandwidth != null) {
-            builder.writeBandwidthLimit(config.bandwidth);
-        }
-        this.log = builder.build();
         this.log.start();
-        this.log.reset();
+        this.log.reset().join();
     }
 
     public static void main(String[] args) throws IOException {
         Namespace ns = parseArgs(Config.parser(), args);
         Config config = new Config(ns);
 
-        resetWALHeader(config.path);
+        prepareWalPath(config.walKind, config.path);
         try (WriteBench bench = new WriteBench(config)) {
             bench.run(config);
         }
@@ -208,9 +223,11 @@ public class WriteBench implements AutoCloseable {
     }
 
     static class Config {
+        final WalBenchmarkKind walKind;
         // following fields are WAL configuration
         final String path;
         final Long capacity;
+        final Long segmentRollThresholdBytes;
         final Integer depth;
         final Integer iops;
         final Long bandwidth;
@@ -222,8 +239,10 @@ public class WriteBench implements AutoCloseable {
         final Long durationSeconds;
 
         Config(Namespace ns) {
+            this.walKind = WalBenchmarkKind.fromCli(ns.getString("wal"));
             this.path = ns.getString("path");
             this.capacity = ns.getLong("capacity");
+            this.segmentRollThresholdBytes = ns.getLong("segmentRollBytes");
             this.depth = ns.getInt("depth");
             this.iops = ns.getInt("iops");
             this.bandwidth = ns.getLong("bandwidth");
@@ -237,14 +256,22 @@ public class WriteBench implements AutoCloseable {
             ArgumentParser parser = ArgumentParsers
                 .newArgumentParser("WriteBench")
                 .defaultHelp(true)
-                .description("Benchmark write performance of BlockWALService");
+                .description("Benchmark write performance of BlockWALService or FilesystemWALService");
+            parser.addArgument("--wal")
+                .choices("block", "filesystem")
+                .setDefault("block")
+                .help("WAL implementation to benchmark");
             parser.addArgument("-p", "--path")
                 .required(true)
-                .help("Path of the WAL file");
+                .help("Block WAL: single file (or block device) path. Filesystem WAL: directory for segment files");
             parser.addArgument("-c", "--capacity")
                 .type(Long.class)
                 .setDefault((long) 1 << 30)
-                .help("Capacity of the WAL in bytes");
+                .help("Block WAL only: capacity of the WAL in bytes (ignored for filesystem WAL)");
+            parser.addArgument("--segment-roll-bytes")
+                .dest("segmentRollBytes")
+                .type(Long.class)
+                .help("Filesystem WAL only: roll to a new segment after this many record bytes per file (default: implementation default, typically 1 GiB)");
             parser.addArgument("-d", "--depth")
                 .type(Integer.class)
                 .help("IO depth of the WAL");

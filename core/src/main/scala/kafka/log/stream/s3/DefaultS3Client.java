@@ -19,6 +19,7 @@
 
 package kafka.log.stream.s3;
 
+import com.automq.stream.s3.wal.impl.filesystem.FilesystemWALService;
 import kafka.autobalancer.metricsreporter.metric.Derivator;
 import kafka.log.stream.s3.metadata.StreamMetadataManager;
 import kafka.log.stream.s3.network.ControllerRequestSender;
@@ -208,6 +209,8 @@ public class DefaultS3Client implements Client {
         switch (uri.protocol()) {
             case "file":
                 return BlockWALService.builder(uri).config(config).build();
+            case "filesystem":
+                return FilesystemWALService.builder(uri).config(config).build();
             case "s3":
                 ObjectStorage walObjectStorage = ObjectStorageFactory.instance()
                     .builder(BucketURI.parse(config.walConfig()))
@@ -226,6 +229,18 @@ public class DefaultS3Client implements Client {
                 return new ObjectWALService(Time.SYSTEM, walObjectStorage, configBuilder.build());
             default:
                 throw new IllegalArgumentException("Invalid WAL schema: " + uri.protocol());
+        }
+    }
+
+    static WriteAheadLog buildRecoveryWAL(IdURI uri, String devicePath) {
+        String recoveryPath = devicePath == null || devicePath.isEmpty() ? uri.path() : devicePath;
+        switch (uri.protocol()) {
+            case "filesystem":
+                return FilesystemWALService.recoveryBuilder(recoveryPath).build();
+            case "file":
+            default:
+                // Keep existing behavior for non-filesystem WAL protocols during failover.
+                return BlockWALService.recoveryBuilder(recoveryPath).build();
         }
     }
 
@@ -281,7 +296,8 @@ public class DefaultS3Client implements Client {
 
             @Override
             public WriteAheadLog getWal(FailoverRequest request) {
-                return BlockWALService.recoveryBuilder(request.getDevice()).build();
+                IdURI uri = IdURI.parse(config.walConfig());
+                return buildRecoveryWAL(uri, request.getDevice());
             }
         }, (wal, sm, om, logger) -> {
             try {

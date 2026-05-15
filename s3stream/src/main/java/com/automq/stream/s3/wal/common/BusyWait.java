@@ -16,20 +16,21 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.bookkeeper.common.collections;
+package com.automq.stream.s3.wal.common;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
-import lombok.experimental.UtilityClass;
-import lombok.extern.slf4j.Slf4j;
 
 /**
  * Utility class to use "Thread.onSpinWait()" when available.
  */
-@UtilityClass
-@Slf4j
 public class BusyWait {
+    private static final Logger LOGGER = LoggerFactory.getLogger(BusyWait.class);
+
 
     /**
      * If available (Java 9+), use intrinsic {@link Thread#onSpinWait} which will
@@ -54,8 +55,8 @@ public class BusyWait {
             handle = MethodHandles.lookup().findStatic(Thread.class, "onSpinWait", MethodType.methodType(void.class));
         } catch (Throwable t) {
             // Ignore
-            if (log.isDebugEnabled()) {
-                log.debug("Unable to use 'onSpinWait' from JVM", t);
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug("Unable to use 'onSpinWait' from JVM", t);
             }
         }
 
