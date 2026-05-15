@@ -30,23 +30,13 @@ import com.automq.stream.s3.trace.context.TraceContext;
 import com.automq.stream.s3.wal.AppendResult;
 import com.automq.stream.s3.wal.RecoverResult;
 import com.automq.stream.s3.wal.WriteAheadLog;
-import com.automq.stream.s3.wal.common.AppendResultImpl;
-import com.automq.stream.s3.wal.common.BatchedBlockingQueue;
-import com.automq.stream.s3.wal.common.BlockingMpscQueue;
 import com.automq.stream.s3.wal.common.Record;
-import com.automq.stream.s3.wal.common.RecordHeader;
-import com.automq.stream.s3.wal.common.RecoverResultImpl;
-import com.automq.stream.s3.wal.common.ShutdownType;
-import com.automq.stream.s3.wal.common.WALMetadata;
+import com.automq.stream.s3.wal.common.*;
 import com.automq.stream.s3.wal.exception.OverCapacityException;
 import com.automq.stream.s3.wal.exception.RuntimeIOException;
 import com.automq.stream.s3.wal.exception.WALShutdownException;
 import com.automq.stream.s3.wal.util.WALUtil;
-import com.automq.stream.utils.FutureUtil;
-import com.automq.stream.utils.IdURI;
-import com.automq.stream.utils.Systems;
-import com.automq.stream.utils.ThreadUtils;
-import com.automq.stream.utils.Threads;
+import com.automq.stream.utils.*;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.CompositeByteBuf;
 import org.apache.commons.lang3.StringUtils;
@@ -56,13 +46,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.Iterator;
-import java.util.List;
-import java.util.NoSuchElementException;
-import java.util.Optional;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -74,9 +58,7 @@ import java.util.stream.Collectors;
 
 import static com.automq.stream.s3.Constants.NOOP_EPOCH;
 import static com.automq.stream.s3.Constants.NOOP_NODE_ID;
-import static com.automq.stream.s3.wal.common.RecordHeader.RECORD_HEADER_MAGIC_CODE;
-import static com.automq.stream.s3.wal.common.RecordHeader.RECORD_HEADER_SIZE;
-import static com.automq.stream.s3.wal.common.RecordHeader.RECORD_HEADER_WITHOUT_CRC_SIZE;
+import static com.automq.stream.s3.wal.common.RecordHeader.*;
 
 /**
  * A file-system based WAL implementation that stores the log across multiple rolling segment
@@ -104,14 +86,19 @@ public class FilesystemWALService implements WriteAheadLog {
     private static final Logger LOGGER = LoggerFactory.getLogger(FilesystemWALService.class);
     private static final FixedSizeByteBufPool HEADER_POOL = new FixedSizeByteBufPool(RECORD_HEADER_SIZE,
         1024 * Systems.CPU_CORES);
-    /** Capacity of the append work queue and of the queue feeding the fsync coalescer. */
+    /**
+     * Capacity of the append work queue and of the queue feeding the fsync coalescer.
+     */
     private static final int DEFAULT_APPEND_QUEUE_CAPACITY = 1000;
-    /** Max number of {@link ForceWriteRequest} items pulled per timed poll in {@link ForceWriteLoop}. */
+    /**
+     * Max number of {@link ForceWriteRequest} items pulled per timed poll in {@link ForceWriteLoop}.
+     */
     private static final int FSYNC_COALESCE_BUFFER_CAPACITY = 1000;
     private final AtomicBoolean started = new AtomicBoolean(false);
     private final AtomicBoolean resetFinished = new AtomicBoolean(false);
     private final AtomicBoolean failed = new AtomicBoolean(false);
-    private final ExecutorService walHeaderFlushExecutor = Threads.newFixedThreadPool(1, ThreadUtils.createThreadFactory(
+    private final ExecutorService walHeaderFlushExecutor = Threads.newFixedThreadPool(1,
+        ThreadUtils.createThreadFactory(
         "flush-file-wal-header-thread-%d", true), LOGGER);
 
     private final ExecutorService writeExecutor = Threads.newFixedThreadPool(1, ThreadUtils.createThreadFactory("file" +
@@ -122,7 +109,9 @@ public class FilesystemWALService implements WriteAheadLog {
 
     private final BatchedBlockingQueue<QueueEntry> appendWorkQueue;
     private final BatchedBlockingQueue<ForceWriteRequest> pendingFsyncQueue;
-    /** Serializes assignment of {@link #nextAppendOffset} (next record's logical start offset). */
+    /**
+     * Serializes assignment of {@link #nextAppendOffset} (next record's logical start offset).
+     */
     private final ReentrantLock appendOffsetLock = new ReentrantLock();
     // The maximum time (in ms) the write thread waits before flushing a partial batch.
     private long groupWaitMs;
@@ -144,7 +133,9 @@ public class FilesystemWALService implements WriteAheadLog {
     private SegmentManager segmentManager;
     private WalMetadataFile walMetadataFile;
     private FilesystemWALHeader walHeader;
-    /** Exclusive end offset of the next append (logical WAL byte offset). */
+    /**
+     * Exclusive end offset of the next append (logical WAL byte offset).
+     */
     private long nextAppendOffset = 0;
 
     private FilesystemWALService() {
@@ -168,6 +159,31 @@ public class FilesystemWALService implements WriteAheadLog {
 
     public static FilesystemWALServiceBuilder recoveryBuilder(String path) {
         return new FilesystemWALServiceBuilder(path).recoveryMode(true);
+    }
+
+    private static boolean shutdownExecutorGracefully(ExecutorService executor) {
+        executor.shutdown();
+        try {
+            if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+                return false;
+            }
+        } catch (InterruptedException e) {
+            executor.shutdownNow();
+            return false;
+        }
+        return true;
+    }
+
+    private static void shutdownExecutor(ExecutorService executor) {
+        executor.shutdown();
+        try {
+            if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            executor.shutdownNow();
+        }
     }
 
     private void flushWALHeader(ShutdownType shutdownType) throws IOException {
@@ -227,7 +243,7 @@ public class FilesystemWALService implements WriteAheadLog {
         RecordHeader readRecordHeader = RecordHeader.unmarshal(recordHeader);
         if (readRecordHeader.getMagicCode() != RECORD_HEADER_MAGIC_CODE) {
             throw new ReadRecordException(WALUtil.alignNextBlock(recoverStartOffset), String.format("magic code " +
-                "mismatch: expected %d, actual %d, recoverStartOffset: %d", RECORD_HEADER_MAGIC_CODE,
+                    "mismatch: expected %d, actual %d, recoverStartOffset: %d", RECORD_HEADER_MAGIC_CODE,
                 readRecordHeader.getMagicCode(), recoverStartOffset));
         }
 
@@ -368,31 +384,6 @@ public class FilesystemWALService implements WriteAheadLog {
 
         LOGGER.info("file system WAL service shutdown gracefully: {}, cost: {} ms", gracefulShutdown,
             stopWatch.getTime(TimeUnit.MILLISECONDS));
-    }
-
-    private static boolean shutdownExecutorGracefully(ExecutorService executor) {
-        executor.shutdown();
-        try {
-            if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
-                executor.shutdownNow();
-                return false;
-            }
-        } catch (InterruptedException e) {
-            executor.shutdownNow();
-            return false;
-        }
-        return true;
-    }
-
-    private static void shutdownExecutor(ExecutorService executor) {
-        executor.shutdown();
-        try {
-            if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
-                executor.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            executor.shutdownNow();
-        }
     }
 
     @Override
@@ -717,7 +708,7 @@ public class FilesystemWALService implements WriteAheadLog {
              *
              * @param recordStartOffset The start offset of this record.
              * @param emptyHeader       An empty {@link ByteBuf} with the size of
-             * {@link RecordHeader#RECORD_HEADER_SIZE}
+             *                          {@link RecordHeader#RECORD_HEADER_SIZE}
              *                          . It will be used to marshal the header.
              * @return The record.
              */
@@ -735,7 +726,7 @@ public class FilesystemWALService implements WriteAheadLog {
         private final List<CompletableFuture<AppendResult.CallbackResult>> futures;
 
         private ForceWriteRequest(Segment segment, long firstOffset, long endOffset,
-                          List<CompletableFuture<AppendResult.CallbackResult>> futures) {
+                                  List<CompletableFuture<AppendResult.CallbackResult>> futures) {
             this.segment = segment;
             this.firstOffset = firstOffset;
             this.endOffset = endOffset;
@@ -935,7 +926,8 @@ public class FilesystemWALService implements WriteAheadLog {
         @Override
         public void run() {
             LOGGER.info("file-wal force-write thread started");
-            @SuppressWarnings("unchecked") ForceWriteRequest[] batch = new ForceWriteRequest[FSYNC_COALESCE_BUFFER_CAPACITY];
+            @SuppressWarnings("unchecked") ForceWriteRequest[] batch =
+                new ForceWriteRequest[FSYNC_COALESCE_BUFFER_CAPACITY];
             try {
                 while (started.get() || !writeExecutor.isTerminated()) {
                     try {
