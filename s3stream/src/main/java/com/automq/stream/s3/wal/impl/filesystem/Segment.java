@@ -26,9 +26,7 @@ import org.slf4j.LoggerFactory;
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
-import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * A single WAL segment file using append-only writes. The file contains only record bytes; WAL
@@ -39,19 +37,51 @@ import java.util.concurrent.atomic.AtomicLong;
 public class Segment {
     private static final Logger LOGGER = LoggerFactory.getLogger(Segment.class);
 
-    private final long startOffset;
+    /**
+     * Default capacity (bytes) of the per-segment {@link BufferedChannel} write buffer.
+     */
+    public static final int DEFAULT_WRITE_BUFFER_CAPACITY = 64 << 10;
+    private static final int WRITE_BUFFER = DEFAULT_WRITE_BUFFER_CAPACITY;
+    private final long startWalOffset;
     private final File file;
     /**
      * Next byte position to write in this file (0-based). Also represents the current file size
      * for an append-only segment.
      */
-    private final AtomicLong nextWritePosition = new AtomicLong(0);
     private RandomAccessFile raf;
     private FileChannel fileChannel;
+    private BufferedChannel bc;
+    /**
+     * Next byte position to read in this file (0-based), for sequential reads.
+     */
+    private long nextReadPosition;
 
-    public Segment(File file, long startOffset) {
+    public Segment(File file, long startWalOffset) throws IOException {
+        this(file, startWalOffset, WRITE_BUFFER);
+    }
+
+    public Segment(File file, long startWalOffset, int writeBuffer) throws IOException {
+        if (writeBuffer <= 0) {
+            throw new IllegalArgumentException("writeBuffer must be positive: " + writeBuffer);
+        }
         this.file = file;
-        this.startOffset = startOffset;
+        this.startWalOffset = startWalOffset;
+        boolean exists = file.exists();
+        if (!exists) {
+            File parent = file.getParentFile();
+            if (parent != null && !parent.exists() && !parent.mkdirs()) {
+                throw new IOException("mkdirs " + parent + " failed");
+            }
+            if (!file.createNewFile()) {
+                throw new IOException("create " + file + " failed");
+            }
+        }
+        raf = new RandomAccessFile(file, "rw");
+        fileChannel = raf.getChannel();
+        if (exists) {
+            fileChannel.position(raf.length());
+        }
+        bc = new BufferedChannel(fileChannel, writeBuffer);
     }
 
     /**
@@ -85,7 +115,7 @@ public class Segment {
     }
 
     public long startOffset() {
-        return startOffset;
+        return startWalOffset;
     }
 
     /**
@@ -93,55 +123,24 @@ public class Segment {
      * This is {@code startOffset + nextWritePosition}.
      */
     public long endOffsetExclusive() {
-        return startOffset + nextWritePosition.get();
+        return startWalOffset + file.length();
     }
 
     public File file() {
         return file;
     }
 
-    /**
-     * Open (and create when necessary) the underlying file. For existing files, the write position
-     * is restored from the file size.
-     */
-    public void openOrCreate() throws IOException {
-        boolean exists = file.exists();
-        if (!exists) {
-            File parent = file.getParentFile();
-            if (parent != null && !parent.exists() && !parent.mkdirs()) {
-                throw new IOException("mkdirs " + parent + " failed");
-            }
-            if (!file.createNewFile()) {
-                throw new IOException("create " + file + " failed");
-            }
-        }
-        raf = new RandomAccessFile(file, "rw");
-        fileChannel = raf.getChannel();
-
-        if (exists) {
-            nextWritePosition.set(raf.length());
-        }
-    }
-
-    public boolean isOpen() {
-        return fileChannel != null;
-    }
-
-    public void close() {
-        try {
-            if (fileChannel != null) {
-                fileChannel.close();
-            }
-        } catch (IOException ignored) {
+    public synchronized void close() {
+        if (bc == null) {
+            return;
         }
         try {
-            if (raf != null) {
-                raf.close();
-            }
+            bc.close();
         } catch (IOException ignored) {
         }
         fileChannel = null;
         raf = null;
+        bc = null;
     }
 
     /**
@@ -155,75 +154,56 @@ public class Segment {
     }
 
     /**
-     * Write record bytes at the given WAL logical byte offset. The caller must guarantee that the offset
-     * falls within this segment (or equals {@link #endOffsetExclusive()} for the next append).
+     * Append record bytes to the end of this segment.
      */
-    public long writeAt(ByteBuf src, long walLogicalOffset) throws IOException {
-        assert containsOffset(walLogicalOffset) || walLogicalOffset == endOffsetExclusive() : "offset " + walLogicalOffset + " " +
-            "not writable in segment " + this;
-        long position = positionForOffset(walLogicalOffset);
-        ByteBuffer[] nioBuffers = src.nioBuffers();
-        long bytesWritten = 0;
-        for (ByteBuffer nioBuffer : nioBuffers) {
-            while (nioBuffer.hasRemaining()) {
-                int written = fileChannel.write(nioBuffer, position);
-                if (written == -1) {
-                    throw new IOException("write -1 at position " + position);
-                }
-                position += written;
-                bytesWritten += written;
-            }
-        }
-        src.readerIndex(src.writerIndex());
-        long newEnd = positionForOffset(walLogicalOffset) + bytesWritten;
-        return nextWritePosition.accumulateAndGet(newEnd, Math::max);
+    public void write(ByteBuf src) throws IOException {
+        bc.write(src);
+    }
+
+    /**
+     * Read {@code length} bytes sequentially from the start of this segment file, appending them to
+     * {@code dst}. Each call advances an internal read cursor.
+     */
+    public int read(ByteBuf dst, int length) throws IOException {
+        length = Math.min(length, dst.writableBytes());
+        int read = bc.read(dst, nextReadPosition, length);
+        nextReadPosition += read;
+        return read;
     }
 
     /**
      * Read {@code length} bytes starting at the given WAL logical offset, appending them to {@code dst}.
+     * Used during WAL recovery where records are addressed by global offset.
      */
     public int readAt(ByteBuf dst, long walLogicalOffset, int length) throws IOException {
-        assert containsOffset(walLogicalOffset) : "offset " + walLogicalOffset + " not in segment " + this;
         long position = positionForOffset(walLogicalOffset);
         length = Math.min(length, dst.writableBytes());
-        int total = 0;
-        while (total < length) {
-            int read = dst.writeBytes(fileChannel, position + total, length - total);
-            if (read == -1) {
-                break;
-            }
-            total += read;
-        }
-        return total;
+        return bc.read(dst, position, length);
     }
 
     /**
      * Force pending data to disk.
      */
     public void fsync() throws IOException {
-        if (fileChannel == null) {
-            throw new IOException("segment is closed: " + this);
-        }
-        fileChannel.force(false);
+        bc.flushAndForceWrite(true);
     }
 
-    /**
-     * Suggest the kernel evict page cache pages for the given WAL logical offset range. Best-effort,
-     * currently a no-op pending native-fd integration.
-     */
-    public void adviseDontNeedRange(long walLogicalOffset, long length) {
-    }
+
 
     public boolean containsOffset(long walLogicalOffset) {
-        return walLogicalOffset >= startOffset && walLogicalOffset < endOffsetExclusive();
+        return walLogicalOffset >= startWalOffset && walLogicalOffset < endOffsetExclusive();
     }
 
     public long positionForOffset(long walLogicalOffset) {
-        return walLogicalOffset - startOffset;
+        return walLogicalOffset - startWalOffset;
     }
 
     @Override
     public String toString() {
-        return "Segment{startOffset=" + startOffset + ", endOffsetExclusive=" + endOffsetExclusive() + ", file=" + file + '}';
+        return "Segment{startOffset=" + startWalOffset + ", file=" + file + '}';
+    }
+
+    public long getPosition() {
+        return bc.position();
     }
 }

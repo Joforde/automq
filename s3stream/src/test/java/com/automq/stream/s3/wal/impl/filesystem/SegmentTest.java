@@ -38,29 +38,27 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 class SegmentTest {
 
     @Test
-    void writeAtAndReadBack() throws IOException {
+    void appendAndReadBack() throws IOException {
         String path = TestUtils.tempFilePath();
         File file = new File(path);
         int dataLength = 10;
-        long startOffset = 1024;
+        long startOffset = 0;
         Segment segment = new Segment(file, startOffset);
         try {
-            segment.openOrCreate();
-
             List<byte[]> expected = new ArrayList<>();
             for (int i = 0; i < 10; i++) {
                 ByteBuf data = TestUtils.random(dataLength);
                 byte[] copy = new byte[dataLength];
                 data.getBytes(data.readerIndex(), copy);
                 expected.add(copy);
-                segment.writeAt(data, startOffset + (long) i * dataLength);
+                segment.write(data);
             }
             segment.fsync();
 
             for (int i = 0; i < 10; i++) {
                 ByteBuf readBuf = ByteBufAlloc.byteBuffer(dataLength);
                 try {
-                    int n = segment.readAt(readBuf, startOffset + (long) i * dataLength, dataLength);
+                    int n = segment.read(readBuf, dataLength);
                     assertEquals(dataLength, n);
                     byte[] actual = ByteBufUtil.getBytes(readBuf, readBuf.readerIndex(), readBuf.readableBytes());
                     assertArrayEquals(expected.get(i), actual);
@@ -75,7 +73,7 @@ class SegmentTest {
     }
 
     @Test
-    void writeReadAfterReopen() throws IOException {
+    void appendReadAfterReopen() throws IOException {
         String path = TestUtils.tempFilePath();
         File file = new File(path);
         long startOffset = 4096;
@@ -84,21 +82,18 @@ class SegmentTest {
 
         Segment segment = new Segment(file, startOffset);
         try {
-            segment.openOrCreate();
-
             ByteBuf data = TestUtils.random(dataLength);
             expected = new byte[dataLength];
             data.getBytes(data.readerIndex(), expected);
-            segment.writeAt(data, startOffset);
+            segment.write(data);
             segment.fsync();
             segment.close();
 
             segment = new Segment(file, startOffset);
-            segment.openOrCreate();
 
             ByteBuf readBuf = ByteBufAlloc.byteBuffer(dataLength);
             try {
-                assertEquals(dataLength, segment.readAt(readBuf, startOffset, dataLength));
+                assertEquals(dataLength, segment.read(readBuf, dataLength));
                 assertArrayEquals(expected, ByteBufUtil.getBytes(readBuf));
             } finally {
                 readBuf.release();

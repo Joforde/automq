@@ -33,8 +33,10 @@ import com.automq.stream.s3.objects.StreamObject;
 import com.automq.stream.s3.operator.MemoryObjectStorage;
 import com.automq.stream.s3.operator.ObjectStorage;
 import com.automq.stream.s3.streams.StreamManager;
+import com.automq.stream.s3.wal.AppendResult;
 import com.automq.stream.s3.wal.RecoverResult;
 import com.automq.stream.s3.wal.WriteAheadLog;
+import com.automq.stream.s3.wal.common.AppendResultImpl;
 import com.automq.stream.s3.wal.exception.OverCapacityException;
 import com.automq.stream.s3.wal.impl.MemoryWriteAheadLog;
 
@@ -65,6 +67,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -368,6 +371,40 @@ public class S3StorageTest {
         assertEquals(233L, range.getStreamId());
         assertEquals(10L, range.getStartOffset());
         assertEquals(12L, range.getEndOffset());
+    }
+
+    @Test
+    public void testAppendAckOrderWithOutOfOrderWalOffsets() throws Exception {
+        CompletableFuture<AppendResult.CallbackResult> walFuture1 = new CompletableFuture<>();
+        CompletableFuture<AppendResult.CallbackResult> walFuture2 = new CompletableFuture<>();
+        AtomicInteger appendCounter = new AtomicInteger();
+        Mockito.doAnswer(invocation -> {
+            int index = appendCounter.getAndIncrement();
+            if (index == 0) {
+                // r1 gets larger WAL offset.
+                return new AppendResultImpl(2L, walFuture1);
+            } else if (index == 1) {
+                // r2 gets smaller WAL offset and returns first.
+                return new AppendResultImpl(1L, walFuture2);
+            }
+            return invocation.callRealMethod();
+        }).when(wal).append(any(), any());
+
+        CompletableFuture<Void> cf1 = storage.append(newRecord(233L, 10L));
+        CompletableFuture<Void> cf2 = storage.append(newRecord(233L, 11L));
+
+        walFuture2.complete(() -> 2L);
+        assertThrows(TimeoutException.class, () -> cf2.get(100, TimeUnit.MILLISECONDS));
+        assertFalse(cf1.isDone());
+
+        walFuture1.complete(() -> 3L);
+        cf1.get(3, TimeUnit.SECONDS);
+        cf2.get(3, TimeUnit.SECONDS);
+
+        ReadDataBlock readRst = storage.read(233, 10, 12, 1024).get(3, TimeUnit.SECONDS);
+        assertEquals(2, readRst.getRecords().size());
+        assertEquals(10L, readRst.getRecords().get(0).getBaseOffset());
+        assertEquals(11L, readRst.getRecords().get(1).getBaseOffset());
     }
 
     static class TestRecoverResult implements RecoverResult {

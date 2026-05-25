@@ -83,6 +83,21 @@ public class WriteBench implements AutoCloseable {
                 if (config.segmentRollThresholdBytes != null) {
                     fsBuilder.segmentRollThresholdBytes(config.segmentRollThresholdBytes);
                 }
+                if (config.writeBuffer != null) {
+                    fsBuilder.writeBufferCapacity(config.writeBuffer);
+                }
+                if (config.fsGroupWaitMs != null) {
+                    fsBuilder.groupWaitMs(config.fsGroupWaitMs);
+                }
+                if (config.fsFlushBytes != null) {
+                    fsBuilder.flushBytesThreshold(config.fsFlushBytes);
+                }
+                if (config.fsFlushEntries != null) {
+                    fsBuilder.flushEntriesThreshold(config.fsFlushEntries);
+                }
+                if (config.bandwidth != null) {
+                    fsBuilder.writeBandwidthLimit(config.bandwidth);
+                }
                 this.log = fsBuilder.build();
                 break;
             default:
@@ -228,6 +243,10 @@ public class WriteBench implements AutoCloseable {
         final String path;
         final Long capacity;
         final Long segmentRollThresholdBytes;
+        final Integer writeBuffer;
+        final Long fsGroupWaitMs;
+        final Long fsFlushBytes;
+        final Integer fsFlushEntries;
         final Integer depth;
         final Integer iops;
         final Long bandwidth;
@@ -243,6 +262,10 @@ public class WriteBench implements AutoCloseable {
             this.path = ns.getString("path");
             this.capacity = ns.getLong("capacity");
             this.segmentRollThresholdBytes = ns.getLong("segmentRollBytes");
+            this.writeBuffer = ns.getInt("writeBuffer");
+            this.fsGroupWaitMs = ns.getLong("fsGroupWaitMs");
+            this.fsFlushBytes = ns.getLong("fsFlushBytes");
+            this.fsFlushEntries = ns.getInt("fsFlushEntries");
             this.depth = ns.getInt("depth");
             this.iops = ns.getInt("iops");
             this.bandwidth = ns.getLong("bandwidth");
@@ -272,6 +295,22 @@ public class WriteBench implements AutoCloseable {
                 .dest("segmentRollBytes")
                 .type(Long.class)
                 .help("Filesystem WAL only: roll to a new segment after this many record bytes per file (default: implementation default, typically 1 GiB)");
+            parser.addArgument("--segment-write-buffer-bytes")
+                .dest("segmentWriteBufferBytes")
+                .type(Integer.class)
+                .help("Filesystem WAL only: per-segment write buffer capacity in bytes (BufferedChannel)");
+            parser.addArgument("--fs-group-wait-ms")
+                .dest("fsGroupWaitMs")
+                .type(Long.class)
+                .help("Filesystem WAL only: max wait (ms) before flushing a partial write batch");
+            parser.addArgument("--fs-flush-bytes")
+                .dest("fsFlushBytes")
+                .type(Long.class)
+                .help("Filesystem WAL only: flush when pending batch reaches this many bytes");
+            parser.addArgument("--fs-flush-entries")
+                .dest("fsFlushEntries")
+                .type(Integer.class)
+                .help("Filesystem WAL only: flush when pending batch reaches this many entries");
             parser.addArgument("-d", "--depth")
                 .type(Integer.class)
                 .help("IO depth of the WAL");

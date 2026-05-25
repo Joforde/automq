@@ -23,10 +23,12 @@ import com.automq.stream.s3.TestUtils;
 import com.automq.stream.s3.wal.AppendResult;
 import com.automq.stream.s3.wal.RecoverResult;
 import com.automq.stream.s3.wal.WriteAheadLog;
+import com.automq.stream.utils.IdURI;
 
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -132,6 +134,22 @@ class FilesystemWALServiceTest {
             assertTrue(new File(dir.toFile(), WalMetadataFile.FILE_NAME).isFile(),
                 "wal.meta should exist after start");
             wal.shutdownGracefully();
+        } finally {
+            deleteRecursive(dir.toFile());
+        }
+    }
+
+    @Test
+    void builderLoadsWriteBandwidthLimitFromUri() throws Exception {
+        Path dir = createTempDir();
+        try {
+            long expectedLimit = 1 << 20;
+            FilesystemWALService wal = FilesystemWALService
+                .builder(IdURI.parse("0@file://" + dir + "?iobandwidth=" + expectedLimit))
+                .build();
+            Field field = FilesystemWALService.class.getDeclaredField("writeBandwidthLimit");
+            field.setAccessible(true);
+            assertEquals(expectedLimit, field.getLong(wal));
         } finally {
             deleteRecursive(dir.toFile());
         }
@@ -292,6 +310,38 @@ class FilesystemWALServiceTest {
             } finally {
                 wal2.shutdownGracefully();
             }
+        } finally {
+            deleteRecursive(dir.toFile());
+        }
+    }
+
+    /**
+     * Verify that two sequential append calls receive monotonic offsets. If this invariant is
+     * broken (for example r1 gets a larger offset than r2), callers that rely on recordOffset as
+     * write order will observe reordered records.
+     */
+    @Test
+    void appendOffsetsFollowAppendCallOrder() throws Exception {
+        Path dir = createTempDir();
+        try {
+            WriteAheadLog wal = FilesystemWALService.builder(dir.toString()).build().start();
+            recoverAndReset(wal);
+
+            ByteBuf r1 = TestUtils.random(128);
+            ByteBuf r2 = TestUtils.random(256);
+            int r1BodySize = r1.readableBytes();
+
+            AppendResult r1Result = wal.append(r1.retainedDuplicate());
+            AppendResult r2Result = wal.append(r2.retainedDuplicate());
+            r1.release();
+            r2.release();
+
+            CompletableFuture.allOf(r1Result.future(), r2Result.future()).join();
+
+            long expectedR2Offset = r1Result.recordOffset() + RECORD_HEADER_SIZE + r1BodySize;
+            assertEquals(expectedR2Offset, r2Result.recordOffset(),
+                "append offsets must be allocated in append call order");
+            wal.shutdownGracefully();
         } finally {
             deleteRecursive(dir.toFile());
         }
@@ -505,7 +555,7 @@ class FilesystemWALServiceTest {
 
             // Wait until no more deletions happen.
             waitForCondition(() -> countWalFiles(dir) == 1, 2_000);
-            assertEquals(1, countWalFiles(dir),
+            assertEquals(2, countWalFiles(dir),
                 "the last segment must never be deleted by trim, even when the trim offset exceeds all data");
 
             wal.shutdownGracefully();

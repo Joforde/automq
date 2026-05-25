@@ -43,6 +43,11 @@ public class SegmentManager {
     private static final Logger LOGGER = LoggerFactory.getLogger(SegmentManager.class);
 
     private final File directory;
+    private final int segmentWriteBufferBytes;
+
+    private static final int MAX_BACKUP_JOURNALS = 2;
+
+    private Segment currentSegment;
 
     /**
      * All known segments, keyed by start offset. Sorted in ascending order. Access must be
@@ -51,8 +56,12 @@ public class SegmentManager {
     private final NavigableMap<Long, Segment> segments = new TreeMap<>();
     private final ReentrantLock segmentsLock = new ReentrantLock();
 
-    public SegmentManager(File directory) {
+    public SegmentManager(File directory, int segmentWriteBufferBytes) {
+        if (segmentWriteBufferBytes <= 0) {
+            throw new IllegalArgumentException("segmentWriteBufferBytes must be positive: " + segmentWriteBufferBytes);
+        }
         this.directory = directory;
+        this.segmentWriteBufferBytes = segmentWriteBufferBytes;
     }
 
     /**
@@ -78,8 +87,7 @@ public class SegmentManager {
                 if (startOffset < 0) {
                     continue;
                 }
-                Segment segment = new Segment(file, startOffset);
-                segment.openOrCreate();
+                Segment segment = new Segment(file, startOffset, segmentWriteBufferBytes);
                 Segment prev = segments.put(segment.startOffset(), segment);
                 if (prev != null) {
                     prev.close();
@@ -134,50 +142,24 @@ public class SegmentManager {
     }
 
     /**
-     * Find the smallest segment whose start offset is greater than {@code walLogicalOffset}. Useful
+     * Find the smallest segment whose start offset is greater than {@code walOffset}. Useful
      * during recovery when a hole in the segment range needs to be skipped (e.g. earlier segments
      * have been trimmed and deleted).
      */
-    public Segment nextSegmentAfter(long walLogicalOffset) {
+    public Segment nextSegmentAfter(long walOffset) {
         segmentsLock.lock();
         try {
-            Map.Entry<Long, Segment> entry = segments.higherEntry(walLogicalOffset);
+            Map.Entry<Long, Segment> entry = segments.higherEntry(walOffset);
             return entry == null ? null : entry.getValue();
         } finally {
             segmentsLock.unlock();
         }
     }
 
-    /**
-     * Get the segment that should own {@code walLogicalOffset}. If the offset falls within an existing
-     * segment, that segment is returned. Otherwise a new segment is created with
-     * {@code startOffset = walLogicalOffset}.
-     * <p>
-     * For append-only writes, the caller should ensure offsets are monotonically increasing so that
-     * the latest segment naturally covers the new offset or a new segment is created.
-     */
-    public Segment getOrCreateSegmentForOffset(long walLogicalOffset) throws IOException {
+    public void rollOverSegment(long walOffset) throws IOException {
         segmentsLock.lock();
         try {
-            // Check if any existing segment covers this offset.
-            Map.Entry<Long, Segment> entry = segments.floorEntry(walLogicalOffset);
-            if (entry != null) {
-                Segment segment = entry.getValue();
-                // The segment covers this offset if it's within the written range, or if it's
-                // the latest segment and the offset is at or beyond its current end (append case).
-                if (segment.containsOffset(walLogicalOffset) || walLogicalOffset == segment.endOffsetExclusive()) {
-                    return segment;
-                }
-                // Check if this is the latest segment - appends always go to the latest segment.
-                Map.Entry<Long, Segment> lastEntry = segments.lastEntry();
-                if (lastEntry != null && lastEntry.getValue() == segment) {
-                    // This is the latest segment but the offset is beyond its end - still use it
-                    // for append (the offset should be contiguous).
-                    return segment;
-                }
-            }
-            // No existing segment covers this offset; create a new one.
-            return createNewSegment(walLogicalOffset);
+            currentSegment = createNewSegment(walOffset);
         } finally {
             segmentsLock.unlock();
         }
@@ -186,36 +168,24 @@ public class SegmentManager {
     /**
      * Create a new segment starting at the given offset. Must be called while holding {@link #segmentsLock}.
      */
-    private Segment createNewSegment(long startOffset) throws IOException {
-        File file = new File(directory, Segment.buildFileName(startOffset));
-        Segment segment = new Segment(file, startOffset);
-        segment.openOrCreate();
+    private Segment createNewSegment(long walOffset) throws IOException {
+        File file = new File(directory, Segment.buildFileName(walOffset));
+        Segment segment = new Segment(file, walOffset, segmentWriteBufferBytes);
         segments.put(segment.startOffset(), segment);
         LOGGER.info("created new WAL segment {}", segment);
         return segment;
     }
 
     /**
-     * Create a new segment explicitly with the given start offset. This is used when the caller
-     * knows a new segment should be started (e.g. rollover).
-     */
-    public Segment createSegment(long startOffset) throws IOException {
-        segmentsLock.lock();
-        try {
-            return createNewSegment(startOffset);
-        } finally {
-            segmentsLock.unlock();
-        }
-    }
-
-    /**
      * Returns the most recently created segment by start offset.
      */
-    public Segment latestSegment() {
+    public Segment latestSegment(long startOffset) throws IOException {
         segmentsLock.lock();
         try {
-            Map.Entry<Long, Segment> entry = segments.lastEntry();
-            return entry == null ? null : entry.getValue();
+            if (currentSegment == null) {
+                rollOverSegment(startOffset);
+            }
+            return currentSegment;
         } finally {
             segmentsLock.unlock();
         }
@@ -240,7 +210,7 @@ public class SegmentManager {
      * other words, segments that contain no offset greater than {@code trimOffset}.
      */
     public int deleteSegmentsBelowOrEqual(long trimOffset) {
-        if (trimOffset < 0) {
+        if (trimOffset < 0 || segments.size() < MAX_BACKUP_JOURNALS) {
             return 0;
         }
         int deleted = 0;
@@ -254,7 +224,7 @@ public class SegmentManager {
                 if (segments.size() == 1) {
                     break;
                 }
-                if (segment.endOffsetExclusive() <= trimOffset + 1) {
+                if (segment.startOffset() < trimOffset) {
                     iter.remove();
                     segment.deleteQuietly();
                     LOGGER.info("trimmed segment {}", segment);
@@ -263,6 +233,8 @@ public class SegmentManager {
                     break;
                 }
             }
+        } catch (Exception e) {
+            LOGGER.error(e.getMessage(), e);
         } finally {
             segmentsLock.unlock();
         }
