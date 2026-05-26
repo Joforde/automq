@@ -472,7 +472,7 @@ public class FilesystemWALService implements WriteAheadLog {
         }
         long trimmedOffset = walHeader.getTrimOffset();
         long recoverStartOffset = Math.max(trimmedOffset, 0);
-        return new RecoverIterator(recoverStartOffset, trimmedOffset);
+        return new RecoverIterator(recoverStartOffset);
     }
 
     @Override
@@ -483,7 +483,16 @@ public class FilesystemWALService implements WriteAheadLog {
         long current = walHeader.getTrimOffset();
         long highestEnd = segmentManager.highestKnownEndOffset();
         long newStartOffset = Math.max(current + 1, highestEnd);
-        CompletableFuture<Void> cf = trim(newStartOffset - 1, true).thenRun(() -> resetFinished.set(true));
+        CompletableFuture<Void> cf = trim(newStartOffset - 1, true).thenRun(() -> {
+            appendOffsetLock.lock();
+            try {
+                nextAppendOffset = newStartOffset;
+                segmentManager.clearCurrentSegment();
+                resetFinished.set(true);
+            } finally {
+                appendOffsetLock.unlock();
+            }
+        });
 
         if (!recoveryMode) {
             return cf.thenRun(this::registerMetrics);
@@ -992,7 +1001,7 @@ public class FilesystemWALService implements WriteAheadLog {
         private long firstInvalidOffset = -1;
         private RecoverResult next;
 
-        public RecoverIterator(long nextRecoverOffset, long skipRecordAtOffset) {
+        public RecoverIterator(long nextRecoverOffset) {
             this.nextRecoverOffset = nextRecoverOffset;
         }
 

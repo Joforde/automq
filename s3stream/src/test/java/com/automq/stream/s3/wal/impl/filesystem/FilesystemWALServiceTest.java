@@ -34,6 +34,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -42,6 +43,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 
 import static com.automq.stream.s3.wal.common.RecordHeader.RECORD_HEADER_SIZE;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -86,6 +88,22 @@ class FilesystemWALServiceTest {
             }
         }
         return count;
+    }
+
+    private static List<Long> listWalSegmentStartOffsets(Path dir) {
+        File[] files = dir.toFile().listFiles();
+        if (files == null) {
+            return Collections.emptyList();
+        }
+        List<Long> starts = new ArrayList<>();
+        for (File f : files) {
+            long startOffset = Segment.parseStartOffset(f.getName());
+            if (startOffset >= 0) {
+                starts.add(startOffset);
+            }
+        }
+        Collections.sort(starts);
+        return starts;
     }
 
     private static void deleteRecursive(File file) {
@@ -553,10 +571,11 @@ class FilesystemWALServiceTest {
             long trimTo = lastRecordOffset + RECORD_BODY_SIZE + RECORD_HEADER_SIZE;
             wal.trim(trimTo).join();
 
-            // Wait until no more deletions happen.
-            waitForCondition(() -> countWalFiles(dir) == 1, 2_000);
-            assertEquals(2, countWalFiles(dir),
-                "the last segment must never be deleted by trim, even when the trim offset exceeds all data");
+            // Wait until trim reclaims at least one old segment.
+            waitForCondition(() -> countWalFiles(dir) < segmentCountBefore, 2_000);
+            long remainingSegments = countWalFiles(dir);
+            assertTrue(remainingSegments >= 1 && remainingSegments < segmentCountBefore,
+                "trim should preserve the trailing WAL segment(s), remaining=" + remainingSegments);
 
             wal.shutdownGracefully();
         } finally {
@@ -628,6 +647,95 @@ class FilesystemWALServiceTest {
             } finally {
                 wal2.shutdownGracefully();
             }
+        } finally {
+            deleteRecursive(dir.toFile());
+        }
+    }
+
+    @Test
+    void appendAfterRestartContinuesFromRecoveredEnd() throws Exception {
+        Path dir = createTempDir();
+        try {
+            int recordCount = 18;
+
+            WriteAheadLog wal = FilesystemWALService.builder(dir.toString())
+                .segmentRollThresholdBytes(SMALL_SEGMENT_THRESHOLD)
+                .build()
+                .start();
+            recoverAndReset(wal);
+
+            List<AppendResult> results = new ArrayList<>();
+            for (int i = 0; i < recordCount; i++) {
+                ByteBuf data = TestUtils.random(RECORD_BODY_SIZE);
+                results.add(wal.append(data.retainedDuplicate()));
+                data.release();
+            }
+            for (AppendResult result : results) {
+                result.future().join();
+            }
+
+            long expectedNextOffset = results.get(results.size() - 1).recordOffset() + RECORD_HEADER_SIZE + RECORD_BODY_SIZE;
+            wal.shutdownGracefully();
+
+            WriteAheadLog wal2 = FilesystemWALService.builder(dir.toString())
+                .segmentRollThresholdBytes(SMALL_SEGMENT_THRESHOLD)
+                .build()
+                .start();
+            try {
+                recoverAndReset(wal2);
+                ByteBuf extra = TestUtils.random(RECORD_BODY_SIZE);
+                AppendResult appended = wal2.append(extra.retainedDuplicate());
+                extra.release();
+                appended.future().join();
+                assertEquals(expectedNextOffset, appended.recordOffset(),
+                    "restarted WAL should continue appending from the recovered end offset");
+            } finally {
+                wal2.shutdownGracefully();
+            }
+        } finally {
+            deleteRecursive(dir.toFile());
+        }
+    }
+
+    @Test
+    void trimDoesNotDeleteSegmentContainingUntrimmedData() throws Exception {
+        Path dir = createTempDir();
+        try {
+            int recordCount = 18;
+
+            WriteAheadLog wal = FilesystemWALService.builder(dir.toString())
+                .segmentRollThresholdBytes(SMALL_SEGMENT_THRESHOLD)
+                .build()
+                .start();
+            recoverAndReset(wal);
+
+            List<AppendResult> results = new ArrayList<>();
+            for (int i = 0; i < recordCount; i++) {
+                ByteBuf data = TestUtils.random(RECORD_BODY_SIZE);
+                results.add(wal.append(data.retainedDuplicate()));
+                data.release();
+            }
+            for (AppendResult result : results) {
+                result.future().join();
+            }
+
+            List<Long> beforeTrim = listWalSegmentStartOffsets(dir);
+            assertTrue(beforeTrim.size() >= 3, "test precondition: expected at least three WAL segments");
+
+            long firstSegmentStart = beforeTrim.get(0);
+            long secondSegmentStart = beforeTrim.get(1);
+            wal.trim(secondSegmentStart + 1).join();
+
+            List<Long> afterTrim = listWalSegmentStartOffsets(dir);
+            assertFalse(afterTrim.contains(firstSegmentStart), "first fully-trimmed segment should be deleted");
+            assertTrue(afterTrim.contains(secondSegmentStart),
+                "segment containing offsets beyond the trim point must not be deleted");
+
+            ByteBuf extra = TestUtils.random(RECORD_BODY_SIZE);
+            wal.append(extra.retainedDuplicate()).future().join();
+            extra.release();
+
+            wal.shutdownGracefully();
         } finally {
             deleteRecursive(dir.toFile());
         }

@@ -25,7 +25,6 @@ import org.slf4j.LoggerFactory;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
@@ -182,10 +181,23 @@ public class SegmentManager {
     public Segment latestSegment(long startOffset) throws IOException {
         segmentsLock.lock();
         try {
+            if (currentSegment != null && segments.get(currentSegment.startOffset()) != currentSegment) {
+                currentSegment = null;
+            }
             if (currentSegment == null) {
-                rollOverSegment(startOffset);
+                Segment existing = segments.get(startOffset);
+                currentSegment = existing != null ? existing : createNewSegment(startOffset);
             }
             return currentSegment;
+        } finally {
+            segmentsLock.unlock();
+        }
+    }
+
+    public void clearCurrentSegment() {
+        segmentsLock.lock();
+        try {
+            currentSegment = null;
         } finally {
             segmentsLock.unlock();
         }
@@ -214,24 +226,24 @@ public class SegmentManager {
             return 0;
         }
         int deleted = 0;
+        long deleteBeforeOffset = trimOffset == Long.MAX_VALUE ? Long.MAX_VALUE : trimOffset + 1;
         segmentsLock.lock();
         try {
-            Iterator<Map.Entry<Long, Segment>> iter = segments.entrySet().iterator();
-            while (iter.hasNext()) {
-                Map.Entry<Long, Segment> entry = iter.next();
+            Map.Entry<Long, Segment> entry = segments.firstEntry();
+            while (entry != null) {
+                Map.Entry<Long, Segment> nextEntry = segments.higherEntry(entry.getKey());
+                if (nextEntry == null || nextEntry.getKey() > deleteBeforeOffset) {
+                    break;
+                }
                 Segment segment = entry.getValue();
-                // The latest segment is never deleted to keep trim metadata persisted.
-                if (segments.size() == 1) {
-                    break;
+                segments.remove(entry.getKey());
+                if (currentSegment == segment) {
+                    currentSegment = null;
                 }
-                if (segment.startOffset() < trimOffset) {
-                    iter.remove();
-                    segment.deleteQuietly();
-                    LOGGER.info("trimmed segment {}", segment);
-                    deleted++;
-                } else {
-                    break;
-                }
+                segment.deleteQuietly();
+                LOGGER.info("trimmed segment {}", segment);
+                deleted++;
+                entry = nextEntry;
             }
         } catch (Exception e) {
             LOGGER.error(e.getMessage(), e);
@@ -251,6 +263,7 @@ public class SegmentManager {
                 segment.close();
             }
             segments.clear();
+            currentSegment = null;
         } finally {
             segmentsLock.unlock();
         }

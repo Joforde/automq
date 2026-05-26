@@ -33,6 +33,8 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @Tag("S3Unit")
 class SegmentTest {
@@ -97,6 +99,74 @@ class SegmentTest {
                 assertArrayEquals(expected, ByteBufUtil.getBytes(readBuf));
             } finally {
                 readBuf.release();
+            }
+        } finally {
+            segment.deleteQuietly();
+        }
+    }
+
+    @Test
+    void offsetsUseExclusiveEndBoundary() throws IOException {
+        String path = TestUtils.tempFilePath();
+        File file = new File(path);
+        long startOffset = 1024;
+        int firstRecordSize = 17;
+        int secondRecordSize = 23;
+
+        Segment segment = new Segment(file, startOffset);
+        try {
+            long firstWalOffset = startOffset;
+            long secondWalOffset = firstWalOffset + firstRecordSize;
+            long flushedMarkOffset = secondWalOffset + secondRecordSize;
+
+            byte[] firstExpected;
+            ByteBuf first = TestUtils.random(firstRecordSize);
+            try {
+                firstExpected = ByteBufUtil.getBytes(first, first.readerIndex(), first.readableBytes());
+                segment.write(first);
+            } finally {
+                first.release();
+            }
+
+            byte[] secondExpected;
+            ByteBuf second = TestUtils.random(secondRecordSize);
+            try {
+                secondExpected = ByteBufUtil.getBytes(second, second.readerIndex(), second.readableBytes());
+                segment.write(second);
+            } finally {
+                second.release();
+            }
+            segment.fsync();
+
+            assertEquals(secondWalOffset, firstWalOffset + firstRecordSize,
+                "nextAppendOffset should advance to the exclusive end of the previous record");
+            assertEquals(flushedMarkOffset, segment.endOffsetExclusive(),
+                "flushedMarkOffset should match the segment's exclusive end offset");
+
+            assertFalse(segment.containsOffset(startOffset - 1), "offset before the segment start must be excluded");
+            assertTrue(segment.containsOffset(firstWalOffset), "first record start offset must be included");
+            assertTrue(segment.containsOffset(secondWalOffset - 1),
+                "last byte of the first record must still belong to the segment");
+            assertTrue(segment.containsOffset(secondWalOffset),
+                "the exclusive end of the first record is the valid start of the next record");
+            assertTrue(segment.containsOffset(flushedMarkOffset - 1),
+                "last written byte should be inside the segment range");
+            assertFalse(segment.containsOffset(flushedMarkOffset),
+                "exclusive end offset must not be considered part of the segment");
+
+            assertEquals(0, segment.positionForOffset(firstWalOffset));
+            assertEquals(firstRecordSize, segment.positionForOffset(secondWalOffset));
+
+            ByteBuf firstRead = ByteBufAlloc.byteBuffer(firstRecordSize);
+            ByteBuf secondRead = ByteBufAlloc.byteBuffer(secondRecordSize);
+            try {
+                assertEquals(firstRecordSize, segment.readAt(firstRead, firstWalOffset, firstRecordSize));
+                assertEquals(secondRecordSize, segment.readAt(secondRead, secondWalOffset, secondRecordSize));
+                assertArrayEquals(firstExpected, ByteBufUtil.getBytes(firstRead));
+                assertArrayEquals(secondExpected, ByteBufUtil.getBytes(secondRead));
+            } finally {
+                firstRead.release();
+                secondRead.release();
             }
         } finally {
             segment.deleteQuietly();
