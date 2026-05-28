@@ -122,7 +122,7 @@ public class Segment {
      * Returns the exclusive end offset of this segment based on actual bytes written.
      * This is {@code startOffset + nextWritePosition}.
      */
-    public long endOffsetExclusive() {
+    public synchronized long endOffsetExclusive() {
         return startWalOffset + file.length();
     }
 
@@ -203,7 +203,7 @@ public class Segment {
         return "Segment{startOffset=" + startWalOffset + ", file=" + file + '}';
     }
 
-    public long getPosition() {
+    public synchronized long getPosition() {
         return bc.position();
     }
 }
