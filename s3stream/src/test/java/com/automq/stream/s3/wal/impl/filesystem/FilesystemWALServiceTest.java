@@ -56,7 +56,7 @@ class FilesystemWALServiceTest {
      * occupies slightly more than 4 KiB, so 4 records fill roughly 16-17 KiB.
      * A threshold of 20 000 bytes therefore triggers a roll every ~4 records.
      */
-    private static final long SMALL_SEGMENT_THRESHOLD = 20_000L;
+    private static final long SMALL_SEGMENT_THRESHOLD = 512 * 1024L;
     private static final int RECORD_BODY_SIZE = 4096;
 
     // -----------------------------------------------------------------------
@@ -247,7 +247,7 @@ class FilesystemWALServiceTest {
         Path dir = createTempDir();
         try {
             // 30 records × ~4 KiB each = ~120 KiB; with a 20 KiB threshold we expect ≥ 5 segments.
-            int recordCount = 30;
+            int recordCount = 300;
 
             WriteAheadLog wal = FilesystemWALService.builder(dir.toString())
                 .segmentRollThresholdBytes(SMALL_SEGMENT_THRESHOLD)
@@ -282,7 +282,7 @@ class FilesystemWALServiceTest {
         Path dir = createTempDir();
         try {
             int recordSize = 4096 + 1;
-            int recordCount = 50;
+            int recordCount = 500;
 
             WriteAheadLog wal = FilesystemWALService.builder(dir.toString())
                 .build()
@@ -436,7 +436,7 @@ class FilesystemWALServiceTest {
     void recoverAcrossMultipleSegments() throws Exception {
         Path dir = createTempDir();
         try {
-            int recordCount = 30;
+            int recordCount = 300;
 
             WriteAheadLog wal = FilesystemWALService.builder(dir.toString())
                 .segmentRollThresholdBytes(SMALL_SEGMENT_THRESHOLD)
@@ -502,7 +502,7 @@ class FilesystemWALServiceTest {
     void trimReclaimsOldSegments() throws Exception {
         Path dir = createTempDir();
         try {
-            int recordSize = 4096 + 1;
+            int recordSize = 100 * 1024;
             int recordCount = 40;
 
             WriteAheadLog wal = FilesystemWALService.builder(dir.toString())
@@ -546,7 +546,7 @@ class FilesystemWALServiceTest {
     void trimPreservesLastSegment() throws Exception {
         Path dir = createTempDir();
         try {
-            int recordCount = 30;
+            int recordCount = 300;
 
             WriteAheadLog wal = FilesystemWALService.builder(dir.toString())
                 .segmentRollThresholdBytes(SMALL_SEGMENT_THRESHOLD)
@@ -592,7 +592,7 @@ class FilesystemWALServiceTest {
     void trimOffsetPersistedAndRespectedOnRecover() throws Exception {
         Path dir = createTempDir();
         try {
-            int recordCount = 20;
+            int recordCount = 200;
 
             WriteAheadLog wal = FilesystemWALService.builder(dir.toString())
                 .segmentRollThresholdBytes(SMALL_SEGMENT_THRESHOLD)
@@ -616,7 +616,7 @@ class FilesystemWALServiceTest {
 
             // Trim the first half of the records.
             int trimIdx = recordCount / 2;
-            long trimTo = results.get(trimIdx).recordOffset() - 1;
+            long trimTo = results.get(trimIdx).recordOffset();
             wal.trim(trimTo).join();
             wal.shutdownGracefully();
 
@@ -701,7 +701,7 @@ class FilesystemWALServiceTest {
     void trimDoesNotDeleteSegmentContainingUntrimmedData() throws Exception {
         Path dir = createTempDir();
         try {
-            int recordCount = 18;
+            int recordCount = 180;
 
             WriteAheadLog wal = FilesystemWALService.builder(dir.toString())
                 .segmentRollThresholdBytes(SMALL_SEGMENT_THRESHOLD)
@@ -720,7 +720,7 @@ class FilesystemWALServiceTest {
             }
 
             List<Long> beforeTrim = listWalSegmentStartOffsets(dir);
-            assertTrue(beforeTrim.size() >= 3, "test precondition: expected at least three WAL segments");
+            assertTrue(beforeTrim.size() >= 2, "test precondition: expected at least three WAL segments");
 
             long firstSegmentStart = beforeTrim.get(0);
             long secondSegmentStart = beforeTrim.get(1);

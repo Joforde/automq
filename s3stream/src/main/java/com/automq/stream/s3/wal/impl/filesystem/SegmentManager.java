@@ -42,7 +42,6 @@ public class SegmentManager {
     private static final Logger LOGGER = LoggerFactory.getLogger(SegmentManager.class);
 
     private final File directory;
-    private final int segmentWriteBufferBytes;
 
     private static final int MAX_BACKUP_JOURNALS = 2;
 
@@ -55,12 +54,8 @@ public class SegmentManager {
     private final NavigableMap<Long, Segment> segments = new TreeMap<>();
     private final ReentrantLock segmentsLock = new ReentrantLock();
 
-    public SegmentManager(File directory, int segmentWriteBufferBytes) {
-        if (segmentWriteBufferBytes <= 0) {
-            throw new IllegalArgumentException("segmentWriteBufferBytes must be positive: " + segmentWriteBufferBytes);
-        }
+    public SegmentManager(File directory) {
         this.directory = directory;
-        this.segmentWriteBufferBytes = segmentWriteBufferBytes;
     }
 
     /**
@@ -86,7 +81,7 @@ public class SegmentManager {
                 if (startOffset < 0) {
                     continue;
                 }
-                Segment segment = new Segment(file, startOffset, segmentWriteBufferBytes);
+                Segment segment = new Segment(file, startOffset);
                 Segment prev = segments.put(segment.startOffset(), segment);
                 if (prev != null) {
                     prev.close();
@@ -169,7 +164,7 @@ public class SegmentManager {
      */
     private Segment createNewSegment(long walOffset) throws IOException {
         File file = new File(directory, Segment.buildFileName(walOffset));
-        Segment segment = new Segment(file, walOffset, segmentWriteBufferBytes);
+        Segment segment = new Segment(file, walOffset);
         segments.put(segment.startOffset(), segment);
         LOGGER.info("created new WAL segment {}", segment);
         return segment;

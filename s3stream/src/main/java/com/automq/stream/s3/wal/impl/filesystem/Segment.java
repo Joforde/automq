@@ -26,6 +26,7 @@ import org.slf4j.LoggerFactory;
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 
 /**
@@ -33,37 +34,29 @@ import java.nio.channels.FileChannel;
  * metadata is stored in {@link WalMetadataFile}.
  * <p>
  * Each segment owns a contiguous range of global record offsets starting from {@code startOffset}.
+ * Writes are issued directly against the underlying {@link FileChannel}; durability is provided
+ * by {@link #fsync()}.
  */
 public class Segment {
     private static final Logger LOGGER = LoggerFactory.getLogger(Segment.class);
 
-    /**
-     * Default capacity (bytes) of the per-segment {@link BufferedChannel} write buffer.
-     */
-    public static final int DEFAULT_WRITE_BUFFER_CAPACITY = 64 << 10;
-    private static final int WRITE_BUFFER = DEFAULT_WRITE_BUFFER_CAPACITY;
     private final long startWalOffset;
     private final File file;
-    /**
-     * Next byte position to write in this file (0-based). Also represents the current file size
-     * for an append-only segment.
-     */
     private RandomAccessFile raf;
     private FileChannel fileChannel;
-    private BufferedChannel bc;
+    /**
+     * Next byte position to write in this file (0-based). Mutated only by the single WAL write
+     * thread, so no synchronization is required for the writer; readers use
+     * {@link FileChannel#read(ByteBuffer, long)} which is unaffected by the channel position.
+     */
+    private long writePosition;
     /**
      * Next byte position to read in this file (0-based), for sequential reads.
      */
     private long nextReadPosition;
+    private volatile boolean closed;
 
     public Segment(File file, long startWalOffset) throws IOException {
-        this(file, startWalOffset, WRITE_BUFFER);
-    }
-
-    public Segment(File file, long startWalOffset, int writeBuffer) throws IOException {
-        if (writeBuffer <= 0) {
-            throw new IllegalArgumentException("writeBuffer must be positive: " + writeBuffer);
-        }
         this.file = file;
         this.startWalOffset = startWalOffset;
         boolean exists = file.exists();
@@ -76,12 +69,9 @@ public class Segment {
                 throw new IOException("create " + file + " failed");
             }
         }
-        raf = new RandomAccessFile(file, "rw");
-        fileChannel = raf.getChannel();
-        if (exists) {
-            fileChannel.position(raf.length());
-        }
-        bc = new BufferedChannel(fileChannel, writeBuffer);
+        this.raf = new RandomAccessFile(file, "rw");
+        this.fileChannel = raf.getChannel();
+        this.writePosition = raf.length();
     }
 
     /**
@@ -120,10 +110,9 @@ public class Segment {
 
     /**
      * Returns the exclusive end offset of this segment based on actual bytes written.
-     * This is {@code startOffset + nextWritePosition}.
      */
     public synchronized long endOffsetExclusive() {
-        return startWalOffset + file.length();
+        return startWalOffset + writePosition;
     }
 
     public File file() {
@@ -131,22 +120,30 @@ public class Segment {
     }
 
     public synchronized void close() {
-        if (bc == null) {
+        if (closed) {
             return;
         }
+        closed = true;
         try {
-            bc.close();
+            if (fileChannel != null) {
+                fileChannel.close();
+            }
+        } catch (IOException ignored) {
+        }
+        try {
+            if (raf != null) {
+                raf.close();
+            }
         } catch (IOException ignored) {
         }
         fileChannel = null;
         raf = null;
-        bc = null;
     }
 
     /**
      * Delete the underlying file. The segment is closed first.
      */
-    public void deleteQuietly() {
+    public synchronized void deleteQuietly() {
         close();
         if (file.exists() && !file.delete()) {
             LOGGER.warn("failed to delete segment file {}", file);
@@ -154,41 +151,84 @@ public class Segment {
     }
 
     /**
-     * Append record bytes to the end of this segment.
+     * Append record bytes to the end of this segment. Not durable until {@link #fsync()} is
+     * called.
+     * <p>
+     * This method must only be invoked from a single writer thread.
      */
-    public void write(ByteBuf src) throws IOException {
-        bc.write(src);
+    public synchronized void write(ByteBuf src) throws IOException {
+        if (closed) {
+            throw new IOException("segment already closed: " + file);
+        }
+        int total = src.readableBytes();
+        if (total <= 0) {
+            return;
+        }
+        ByteBuffer[] buffers = src.nioBuffers();
+        long position = writePosition;
+        long written = 0;
+        // Use positional pwrite calls so writes are independent of the channel position.
+        for (ByteBuffer buffer : buffers) {
+            while (buffer.hasRemaining()) {
+                int n = fileChannel.write(buffer, position + written);
+                if (n < 0) {
+                    throw new IOException("write returned " + n + " on " + file);
+                }
+                written += n;
+            }
+        }
+        writePosition = position + written;
     }
 
     /**
      * Read {@code length} bytes sequentially from the start of this segment file, appending them to
      * {@code dst}. Each call advances an internal read cursor.
      */
-    public int read(ByteBuf dst, int length) throws IOException {
-        length = Math.min(length, dst.writableBytes());
-        int read = bc.read(dst, nextReadPosition, length);
-        nextReadPosition += read;
-        return read;
+    public synchronized int read(ByteBuf dst, int length) throws IOException {
+        int n = readAt(dst, startWalOffset + nextReadPosition, length);
+        if (n > 0) {
+            nextReadPosition += n;
+        }
+        return n;
     }
 
     /**
      * Read {@code length} bytes starting at the given WAL logical offset, appending them to {@code dst}.
      * Used during WAL recovery where records are addressed by global offset.
      */
-    public int readAt(ByteBuf dst, long walLogicalOffset, int length) throws IOException {
+    public synchronized int readAt(ByteBuf dst, long walLogicalOffset, int length) throws IOException {
+        if (closed) {
+            throw new IOException("segment already closed: " + file);
+        }
         long position = positionForOffset(walLogicalOffset);
-        length = Math.min(length, dst.writableBytes());
-        return bc.read(dst, position, length);
+        int toRead = Math.min(length, dst.writableBytes());
+        if (toRead <= 0) {
+            return 0;
+        }
+        int total = 0;
+        while (total < toRead) {
+            int read = dst.writeBytes(fileChannel, position + total, toRead - total);
+            if (read < 0) {
+                break;
+            }
+            if (read == 0) {
+                // No more data available at the requested position.
+                break;
+            }
+            total += read;
+        }
+        return total;
     }
 
     /**
      * Force pending data to disk.
      */
-    public void fsync() throws IOException {
-        bc.flushAndForceWrite(true);
+    public synchronized void fsync() throws IOException {
+        if (closed) {
+            throw new IOException("segment already closed: " + file);
+        }
+        fileChannel.force(false);
     }
-
-
 
     public boolean containsOffset(long walLogicalOffset) {
         return walLogicalOffset >= startWalOffset && walLogicalOffset < endOffsetExclusive();
@@ -204,6 +244,6 @@ public class Segment {
     }
 
     public synchronized long getPosition() {
-        return bc.position();
+        return writePosition;
     }
 }

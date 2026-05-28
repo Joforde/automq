@@ -19,7 +19,6 @@
 
 package com.automq.stream.s3.wal.impl.filesystem;
 
-import com.automq.stream.FixedSizeByteBufPool;
 import com.automq.stream.s3.ByteBufAlloc;
 import com.automq.stream.s3.Config;
 import com.automq.stream.s3.metrics.S3StreamMetricsManager;
@@ -33,7 +32,6 @@ import com.automq.stream.s3.wal.WriteAheadLog;
 import com.automq.stream.s3.wal.common.AppendResultImpl;
 import com.automq.stream.s3.wal.common.BatchedBlockingQueue;
 import com.automq.stream.s3.wal.common.BlockingMpscQueue;
-import com.automq.stream.s3.wal.common.Record;
 import com.automq.stream.s3.wal.common.RecordHeader;
 import com.automq.stream.s3.wal.common.RecoverResultImpl;
 import com.automq.stream.s3.wal.common.ShutdownType;
@@ -41,15 +39,13 @@ import com.automq.stream.s3.wal.common.WALMetadata;
 import com.automq.stream.s3.wal.exception.OverCapacityException;
 import com.automq.stream.s3.wal.exception.RuntimeIOException;
 import com.automq.stream.s3.wal.exception.WALShutdownException;
+import com.automq.stream.s3.wal.impl.block.Block;
 import com.automq.stream.s3.wal.util.WALUtil;
 import com.automq.stream.utils.FutureUtil;
 import com.automq.stream.utils.IdURI;
-import com.automq.stream.utils.Systems;
 import com.automq.stream.utils.ThreadUtils;
 import com.automq.stream.utils.Threads;
-import com.google.common.util.concurrent.RateLimiter;
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.CompositeByteBuf;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.time.StopWatch;
 import org.slf4j.Logger;
@@ -59,6 +55,7 @@ import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
@@ -69,7 +66,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.LockSupport;
 import java.util.stream.Collectors;
 
 import static com.automq.stream.s3.Constants.NOOP_EPOCH;
@@ -90,24 +88,28 @@ import static com.automq.stream.s3.wal.common.RecordHeader.RECORD_HEADER_WITHOUT
  * wal-&lt;offset&gt;.log         - append-only data segments (record bytes only)
  * </pre>
  * <p>
- * Append flow:
+ * Append pipeline (similar in spirit to {@code BlockWALService}):
  * <ol>
- *   <li>{@link #append} builds a {@link QueueEntry} and enqueues it for the write thread.</li>
- *   <li>The write thread writes each queued record to its segment <strong>without</strong> calling
- *   fsync.</li>
- *   <li>A single flush thread coalesces batches, fsyncs the affected segments once, completes
- *   the pending {@link AppendResult} futures and advises the kernel to drop the corresponding
- *   page cache range.</li>
+ *   <li>{@link #append} takes the {@code blockLock}, hands the payload to
+ *       {@link FilesystemSlidingWindowService}'s current {@link Block} and returns immediately -
+ *       record header marshalling, segment selection, file I/O and fsync all happen out of the
+ *       critical section.</li>
+ *   <li>The {@code block-poll} thread drains blocks from the sliding window, materialises their
+ *       bytes via {@link Block#data()}, picks the destination segment and enqueues a
+ *       {@link WriteRequest} on the write queue.</li>
+ *   <li>The {@code write} thread consumes the write queue, writes each block to its segment
+ *       (without fsync), coalesces consecutive writes targeting the same segment into a batch
+ *       and hands the batch to the force-write thread for fsync.</li>
+ *   <li>The {@code force-write} thread fsyncs the segment, completes the corresponding append
+ *       futures and releases the underlying buffers.</li>
  * </ol>
  */
 public class FilesystemWALService implements WriteAheadLog {
     private static final Logger LOGGER = LoggerFactory.getLogger(FilesystemWALService.class);
-    private static final FixedSizeByteBufPool HEADER_POOL = new FixedSizeByteBufPool(RECORD_HEADER_SIZE,
-        1024 * Systems.CPU_CORES);
     /**
-     * Capacity of the append work queue and of the queue feeding the fsync coalescer.
+     * Capacity of the write queue and of the queue feeding the fsync coalescer.
      */
-    private static final int DEFAULT_APPEND_QUEUE_CAPACITY = 1000;
+    private static final int DEFAULT_PIPELINE_QUEUE_CAPACITY = 1024;
     /**
      * Max number of {@link ForceWriteRequest} items pulled per timed poll in {@link ForceWriteLoop}.
      */
@@ -120,18 +122,18 @@ public class FilesystemWALService implements WriteAheadLog {
     private final ExecutorService walHeaderFlushExecutor = Threads.newFixedThreadPool(1,
         ThreadUtils.createThreadFactory("flush-file-wal-header-thread-%d", true), LOGGER);
 
-    private final ExecutorService writeExecutor = Threads.newFixedThreadPool(1, ThreadUtils.createThreadFactory("file"
-        + "-wal-write-thread-%d", true), LOGGER);
+    private final ExecutorService blockPollExecutor = Threads.newFixedThreadPool(1, ThreadUtils.createThreadFactory(
+        "file-wal-block-poll-thread-%d", true), LOGGER);
+
+    private final ExecutorService writeExecutor = Threads.newFixedThreadPool(1, ThreadUtils.createThreadFactory(
+        "file-wal-write-thread-%d", true), LOGGER);
 
     private final ExecutorService forceWriteExecutor = Threads.newFixedThreadPool(1, ThreadUtils.createThreadFactory(
         "file-wal-force-write-thread-%d", true), LOGGER);
 
-    private final BatchedBlockingQueue<QueueEntry> appendWorkQueue;
-    private final BatchedBlockingQueue<ForceWriteRequest> pendingFsyncQueue;
-    /**
-     * Serializes assignment of {@link #nextAppendOffset} (next record's logical start offset).
-     */
-    private final ReentrantLock appendOffsetLock = new ReentrantLock();
+    private final BatchedBlockingQueue<WriteRequest> writeQueue;
+    private final BatchedBlockingQueue<ForceWriteRequest> forceQueue;
+
     // The maximum time (in ms) the write thread waits before flushing a partial batch.
     private long groupWaitMs;
     // Once the in-flight batch reaches this many bytes the write thread issues an fsync.
@@ -140,6 +142,10 @@ public class FilesystemWALService implements WriteAheadLog {
     private int flushEntriesThreshold;
     // Max write throughput in bytes/s for the write thread. Long.MAX_VALUE means unlimited.
     private long writeBandwidthLimit = Long.MAX_VALUE;
+    // Max payload bytes per block before it must be sealed and a new block opened.
+    private long blockMaxSize;
+    // Soft size limit per block - the block can exceed this only when it contains a single oversized record.
+    private long blockSoftLimit;
 
     /**
      * Max record bytes per segment file before rolling to a new WAL segment (excluding file headers).
@@ -154,14 +160,11 @@ public class FilesystemWALService implements WriteAheadLog {
     private SegmentManager segmentManager;
     private WalMetadataFile walMetadataFile;
     private FilesystemWALHeader walHeader;
-    /**
-     * Exclusive end offset of the next append (logical WAL byte offset).
-     */
-    private long nextAppendOffset = 0;
+    private FilesystemSlidingWindowService slidingWindowService;
 
     private FilesystemWALService() {
-        appendWorkQueue = new BlockingMpscQueue<>(DEFAULT_APPEND_QUEUE_CAPACITY);
-        pendingFsyncQueue = new BlockingMpscQueue<>(DEFAULT_APPEND_QUEUE_CAPACITY);
+        writeQueue = new BlockingMpscQueue<>(DEFAULT_PIPELINE_QUEUE_CAPACITY);
+        forceQueue = new BlockingMpscQueue<>(DEFAULT_PIPELINE_QUEUE_CAPACITY);
     }
 
     public static FilesystemWALServiceBuilder builder(String path) {
@@ -173,7 +176,8 @@ public class FilesystemWALService implements WriteAheadLog {
         Optional.ofNullable(uri.extensionString("groupWaitMs")).filter(StringUtils::isNumeric).ifPresent(v -> builder.groupWaitMs(Long.parseLong(v)));
         Optional.ofNullable(uri.extensionString("flushBytes")).filter(StringUtils::isNumeric).ifPresent(v -> builder.flushBytesThreshold(Long.parseLong(v)));
         Optional.ofNullable(uri.extensionString("flushEntries")).filter(StringUtils::isNumeric).ifPresent(v -> builder.flushEntriesThreshold(Integer.parseInt(v)));
-        Optional.ofNullable(uri.extensionString("writeBuffer")).filter(StringUtils::isNumeric).ifPresent(v -> builder.writeBufferCapacity(Integer.parseInt(v)));
+        Optional.ofNullable(uri.extensionString("blockMaxSize")).filter(StringUtils::isNumeric).ifPresent(v -> builder.blockMaxSize(Long.parseLong(v)));
+        Optional.ofNullable(uri.extensionString("blockSoftLimit")).filter(StringUtils::isNumeric).ifPresent(v -> builder.blockSoftLimit(Long.parseLong(v)));
         Optional.ofNullable(uri.extensionString("iobandwidth")).filter(StringUtils::isNumeric).ifPresent(v -> builder.writeBandwidthLimit(Long.parseLong(v)));
         Optional.ofNullable(uri.extensionString("segmentRollThresholdBytes")).filter(StringUtils::isNumeric).ifPresent(v -> builder.segmentRollThresholdBytes(Long.parseLong(v)));
         Optional.ofNullable(uri.extensionString("timeout")).filter(StringUtils::isNumeric).ifPresent(v -> builder.timeoutSeconds(Integer.parseInt(v)));
@@ -333,6 +337,7 @@ public class FilesystemWALService implements WriteAheadLog {
         started.set(true);
         this.forceWriteExecutor.submit(new ForceWriteLoop());
         this.writeExecutor.submit(new WriteLoop());
+        this.blockPollExecutor.submit(new BlockPollLoop());
         LOGGER.info("file system WAL service started, cost: {} ms", stopWatch.getTime(TimeUnit.MILLISECONDS));
         return this;
     }
@@ -357,7 +362,13 @@ public class FilesystemWALService implements WriteAheadLog {
     private void registerMetrics() {
         S3StreamMetricsManager.registerDeltaWalOffsetSupplier(() -> {
             try {
-                return this.nextAppendOffset;
+                Lock lock = slidingWindowService.getBlockLock();
+                lock.lock();
+                try {
+                    return slidingWindowService.nextAppendOffsetLocked();
+                } finally {
+                    lock.unlock();
+                }
             } catch (Exception e) {
                 LOGGER.error("failed to get current start offset", e);
                 return 0L;
@@ -374,14 +385,25 @@ public class FilesystemWALService implements WriteAheadLog {
             return;
         }
 
-        // Step 1: drain the write pipeline before trim or metadata flush can race with segment close.
-        boolean gracefulShutdown =
-            shutdownExecutorGracefully(writeExecutor) && shutdownExecutorGracefully(forceWriteExecutor);
+        // Step 1: drain the append pipeline in stage order. Each stage's drain happens in its
+        // shutdown finally block so that everything queued before {@code started=false} is
+        // delivered to the next stage.
+        boolean gracefulShutdown = shutdownExecutorGracefully(blockPollExecutor)
+            && shutdownExecutorGracefully(writeExecutor)
+            && shutdownExecutorGracefully(forceWriteExecutor);
 
-        // Step 2: stop the header-flusher; in-flight trim tasks may still delete segments.
+        // Step 2: fail any futures still buffered inside the sliding window service that did not
+        // make it through the pipeline (only possible on abrupt thread death).
+        Collection<CompletableFuture<AppendResult.CallbackResult>> leftovers =
+            slidingWindowService != null ? slidingWindowService.drainPendingFutures() : Collections.emptyList();
+        for (CompletableFuture<AppendResult.CallbackResult> f : leftovers) {
+            f.completeExceptionally(new WALShutdownException("file-wal shutting down"));
+        }
+
+        // Step 3: stop the header-flusher; in-flight trim tasks may still delete segments.
         shutdownExecutor(walHeaderFlushExecutor);
 
-        // Step 3: persist final metadata and close data segments.
+        // Step 4: persist final metadata and close data segments.
         try {
             flushWALHeader(gracefulShutdown ? ShutdownType.GRACEFULLY : ShutdownType.UNGRACEFULLY);
         } catch (IOException ignored) {
@@ -434,31 +456,31 @@ public class FilesystemWALService implements WriteAheadLog {
 
         final long recordSize = RECORD_HEADER_SIZE + body.readableBytes();
         final CompletableFuture<AppendResult.CallbackResult> appendResultFuture = new CompletableFuture<>();
-        QueueEntry entry = new QueueEntry();
+        long recordOffset;
+
+        Lock lock = slidingWindowService.getBlockLock();
+        lock.lock();
+        try {
+            Block block = slidingWindowService.getCurrentBlockLocked();
+            Block.RecordSupplier supplier =
+                (offset, header) -> WALUtil.generateRecord(body, header, crc, offset);
+            recordOffset = block.addRecord(recordSize, supplier, appendResultFuture);
+            if (recordOffset < 0) {
+                // current block is full - seal it and start a new one
+                block = slidingWindowService.sealAndNewBlockLocked(block);
+                recordOffset = block.addRecord(recordSize, supplier, appendResultFuture);
+            }
+        } finally {
+            lock.unlock();
+        }
+
         CompletableFuture<AppendResult.CallbackResult> timedFuture =
             FutureUtil.timeoutWithNewReturn(appendResultFuture, timeoutSeconds, TimeUnit.SECONDS,
                 () -> failed.set(true));
-        long walOffset = 0;
-        appendOffsetLock.lock();
-        try {
-            walOffset = nextAppendOffset;
-            ByteBuf header = HEADER_POOL.get().retain();
-            entry.setWalOffset(walOffset);
-            entry.setRecord(WALUtil.generateRecord(body, header, crc, walOffset));
-            entry.setFuture(appendResultFuture);
-            appendWorkQueue.put(entry);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            LOGGER.error("Failed to put entry to append work queue", e);
-            AppendResultImpl errRes = new AppendResultImpl(walOffset, timedFuture);
-            errRes.future().completeExceptionally(e);
-            return errRes;
-        } finally {
-            this.nextAppendOffset += recordSize;
-            appendOffsetLock.unlock();
-        }
-        final AppendResult appendResult = new AppendResultImpl(walOffset, timedFuture);
-        appendResult.future().whenComplete((nil, ex) -> StorageOperationStats.getInstance().appendWALCompleteStats.record(TimerUtil.timeElapsedSince(startTime, TimeUnit.NANOSECONDS)));
+        final AppendResult appendResult = new AppendResultImpl(recordOffset, timedFuture);
+        appendResult.future().whenComplete((nil, ex) ->
+            StorageOperationStats.getInstance().appendWALCompleteStats.record(
+                TimerUtil.timeElapsedSince(startTime, TimeUnit.NANOSECONDS)));
         StorageOperationStats.getInstance().appendWALBeforeStats.record(TimerUtil.timeElapsedSince(startTime,
             TimeUnit.NANOSECONDS));
         return appendResult;
@@ -484,14 +506,9 @@ public class FilesystemWALService implements WriteAheadLog {
         long highestEnd = segmentManager.highestKnownEndOffset();
         long newStartOffset = Math.max(current + 1, highestEnd);
         CompletableFuture<Void> cf = trim(newStartOffset - 1, true).thenRun(() -> {
-            appendOffsetLock.lock();
-            try {
-                nextAppendOffset = newStartOffset;
-                segmentManager.clearCurrentSegment();
-                resetFinished.set(true);
-            } finally {
-                appendOffsetLock.unlock();
-            }
+            slidingWindowService.resetTo(newStartOffset);
+            segmentManager.clearCurrentSegment();
+            resetFinished.set(true);
         });
 
         if (!recoveryMode) {
@@ -555,10 +572,6 @@ public class FilesystemWALService implements WriteAheadLog {
     public static class FilesystemWALServiceBuilder {
         private final String directoryPath;
         private long segmentRollThresholdBytes = 1L << 30;
-        /**
-         * Capacity of each {@link Segment}'s {@link BufferedChannel} write buffer in bytes.
-         */
-        private int writeBufferCapacity = Segment.DEFAULT_WRITE_BUFFER_CAPACITY;
         // The maximum time (in ms) the write thread waits before flushing a partial batch.
         private long groupWaitMs = 2;
         // Once the in-flight batch reaches this many bytes the write thread issues an fsync.
@@ -567,6 +580,10 @@ public class FilesystemWALService implements WriteAheadLog {
         private int flushEntriesThreshold = 1024;
         // Max write throughput in bytes/s. Long.MAX_VALUE means unlimited.
         private long writeBandwidthLimit = Long.MAX_VALUE;
+        // Max bytes per in-memory block before a new block is created.
+        private long blockMaxSize = 10L << 20; // 10 MiB
+        // Soft size limit per block (block can exceed it only with a single oversized record).
+        private long blockSoftLimit = 256L << 10; // 256 KiB
         private int timeoutSeconds = 30;
         private int nodeId = NOOP_NODE_ID;
         private long epoch = NOOP_EPOCH;
@@ -595,17 +612,6 @@ public class FilesystemWALService implements WriteAheadLog {
             return this;
         }
 
-        /**
-         * Size of each segment file's in-memory write buffer ({@link BufferedChannel} capacity).
-         */
-        public FilesystemWALServiceBuilder writeBufferCapacity(int writeBufferBytes) {
-            if (writeBufferBytes <= 0) {
-                throw new IllegalArgumentException("writeBufferBytes must be positive: " + writeBufferBytes);
-            }
-            this.writeBufferCapacity = writeBufferBytes;
-            return this;
-        }
-
         public FilesystemWALServiceBuilder groupWaitMs(long groupWaitMs) {
             this.groupWaitMs = groupWaitMs;
             return this;
@@ -626,6 +632,30 @@ public class FilesystemWALService implements WriteAheadLog {
                 throw new IllegalArgumentException("writeBandwidthLimit must be positive: " + writeBandwidthLimit);
             }
             this.writeBandwidthLimit = writeBandwidthLimit;
+            return this;
+        }
+
+        /**
+         * Hard size limit (bytes) for the in-memory append block. Bigger values let more records
+         * coalesce per block, smaller values trade memory for latency.
+         */
+        public FilesystemWALServiceBuilder blockMaxSize(long blockMaxSize) {
+            if (blockMaxSize <= 0) {
+                throw new IllegalArgumentException("blockMaxSize must be positive: " + blockMaxSize);
+            }
+            this.blockMaxSize = blockMaxSize;
+            return this;
+        }
+
+        /**
+         * Soft size limit (bytes) for the in-memory append block. Records that would push a non-empty
+         * block past this limit force the block to be sealed first.
+         */
+        public FilesystemWALServiceBuilder blockSoftLimit(long blockSoftLimit) {
+            if (blockSoftLimit <= 0) {
+                throw new IllegalArgumentException("blockSoftLimit must be positive: " + blockSoftLimit);
+            }
+            this.blockSoftLimit = blockSoftLimit;
             return this;
         }
 
@@ -655,11 +685,14 @@ public class FilesystemWALService implements WriteAheadLog {
                     epoch = NOOP_EPOCH;
                 }
             }
+            if (blockSoftLimit > blockMaxSize) {
+                blockSoftLimit = blockMaxSize;
+            }
 
             FilesystemWALService service = new FilesystemWALService();
             service.directory = new File(directoryPath);
             service.walMetadataFile = new WalMetadataFile(service.directory);
-            service.segmentManager = new SegmentManager(service.directory, writeBufferCapacity);
+            service.segmentManager = new SegmentManager(service.directory);
             service.segmentRollThresholdBytes = segmentRollThresholdBytes;
             service.timeoutSeconds = timeoutSeconds;
             service.recoveryMode = recoveryMode;
@@ -668,6 +701,9 @@ public class FilesystemWALService implements WriteAheadLog {
             service.flushBytesThreshold = flushBytesThreshold;
             service.flushEntriesThreshold = flushEntriesThreshold;
             service.writeBandwidthLimit = writeBandwidthLimit;
+            service.blockMaxSize = blockMaxSize;
+            service.blockSoftLimit = blockSoftLimit;
+            service.slidingWindowService = new FilesystemSlidingWindowService(blockMaxSize, blockSoftLimit);
             if (nodeId != NOOP_NODE_ID) {
                 service.nodeId = nodeId;
                 service.epoch = epoch;
@@ -691,84 +727,116 @@ public class FilesystemWALService implements WriteAheadLog {
         }
     }
 
-    private static final class QueueEntry {
-        private long walOffset;
-        private Record record;
-        private CompletableFuture<AppendResult.CallbackResult> future;
+    /**
+     * A block that has been sealed by the block-poll thread, picked up by the write thread and is
+     * ready to be written into its destination segment.
+     */
+    private static final class WriteRequest {
+        private final Segment segment;
+        private final Block block;
+        private final long startOffset;
+        private final long endOffset;
+        boolean shouldClose;
 
-        public long getWalOffset() {
-            return walOffset;
-        }
-
-        public void setWalOffset(long walOffset) {
-            this.walOffset = walOffset;
-        }
-
-        public CompletableFuture<AppendResult.CallbackResult> getFuture() {
-            return future;
-        }
-
-        public void setFuture(CompletableFuture<AppendResult.CallbackResult> future) {
-            this.future = future;
-        }
-
-        public Record getRecord() {
-            return record;
-        }
-
-        public void setRecord(Record record) {
-            this.record = record;
-        }
-
-        @FunctionalInterface
-        private interface RecordSupplier {
-            /**
-             * Generate a record.
-             *
-             * @param recordStartOffset The start offset of this record.
-             * @param emptyHeader       An empty {@link ByteBuf} with the size of
-             *                          {@link RecordHeader#RECORD_HEADER_SIZE}
-             *                          . It will be used to marshal the header.
-             * @return The record.
-             */
-            Record get(long recordStartOffset, ByteBuf emptyHeader);
+        WriteRequest(Segment segment, Block block, boolean shouldClose) {
+            this.segment = segment;
+            this.block = block;
+            this.startOffset = block.startOffset();
+            this.endOffset = block.startOffset() + block.size();
+            this.shouldClose = shouldClose;
         }
     }
 
     /**
-     * A batch of writes whose payload has been handed to the OS and is waiting for fsync.
+     * A batch of {@link WriteRequest}s whose payload has been handed to the OS and is waiting for
+     * fsync.
      */
     private static final class ForceWriteRequest {
         private final Segment segment;
         private final long startOffset;
         private final long endOffset;
-        private final List<CompletableFuture<AppendResult.CallbackResult>> futures;
+        private final List<Block> blocks;
         private final boolean shouldClose;
 
         private ForceWriteRequest(Segment segment, long startOffset, long endOffset,
-                                  List<CompletableFuture<AppendResult.CallbackResult>> futures, boolean shouldClose) {
+                                  List<Block> blocks, boolean shouldClose) {
             this.segment = segment;
             this.startOffset = startOffset;
             this.endOffset = endOffset;
-            this.futures = futures;
+            this.blocks = blocks;
             this.shouldClose = shouldClose;
         }
+    }
 
-        public void process() {
-            if (shouldClose) {
-                segment.close();
+    /**
+     * Single-threaded block-poll stage: drains sealed {@link Block}s from the sliding window,
+     * materialises their bytes, picks the destination {@link Segment} and hands the resulting
+     * {@link WriteRequest} to the write thread.
+     */
+    private final class BlockPollLoop implements Runnable {
+        @Override
+        public void run() {
+            LOGGER.info("file-wal block-poll thread started");
+            try {
+                while (started.get()) {
+                    Block block = slidingWindowService.pollBlock();
+                    if (block != null) {
+                        handleBlock(block);
+                        // After processing one, try to pick up more without sleeping.
+                        continue;
+                    }
+                    LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(groupWaitMs));
+                }
+            } catch (Throwable t) {
+                started.set(false);
+                LOGGER.error("file-wal block-poll thread terminated unexpectedly", t);
+            } finally {
+                drainOnShutdown();
+                LOGGER.info("file-wal block-poll thread exited");
+            }
+        }
+
+        private void drainOnShutdown() {
+            while (true) {
+                Block block = slidingWindowService.pollBlock();
+                if (block == null) {
+                    break;
+                }
+                handleBlock(block);
+            }
+        }
+
+        private void handleBlock(Block block) {
+            try {
+                block.polled();
+                long blockStartOffset = block.startOffset();
+                Segment segment = segmentManager.latestSegment(blockStartOffset);
+                // Force record-header generation outside the append critical section.
+                block.data();
+                boolean shouldClose = segment.getPosition() > segmentRollThresholdBytes;
+                writeQueue.put(new WriteRequest(segment, block, shouldClose));
+                if (shouldClose) {
+                    segmentManager.rollOverSegment(block.endOffset());
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                FutureUtil.completeExceptionally(block.futures().iterator(),
+                    new WALShutdownException("interrupted while enqueuing write request"));
+                block.release();
+            } catch (Exception e) {
+                LOGGER.error("failed to handle block, walOffset: {}", block.startOffset(), e);
+                FutureUtil.completeExceptionally(block.futures().iterator(), e);
+                block.release();
             }
         }
     }
 
     /**
-     * Single-threaded write stage: consumes {@link QueueEntry} items, writes each record to the
-     * right segment (no fsync) and hands off complete batches to the force-write thread.
+     * Single-threaded write stage: consumes {@link WriteRequest}s, writes each block to its
+     * segment (no fsync) and hands off complete batches to the force-write thread.
      */
     private final class WriteLoop implements Runnable {
-        private final List<CompletableFuture<AppendResult.CallbackResult>> batchFutures = new ArrayList<>();
-        private final RateLimiter writeBandwidthLimiter = writeBandwidthLimit == Long.MAX_VALUE
-            ? null : RateLimiter.create((double) writeBandwidthLimit);
+        private final List<Block> batchBlocks = new ArrayList<>();
         private Segment batchSegment = null;
         private long batchStartOffset = -1;
         private long batchEndOffset = -1;
@@ -780,112 +848,121 @@ public class FilesystemWALService implements WriteAheadLog {
         public void run() {
             LOGGER.info("file-wal write thread started");
             try {
-                while (started.get()) {
-                    QueueEntry entry;
-                    try {
-                        // Timed wait so a partial batch can be flushed when producers go idle and
-                        // byte/entry thresholds are not reached.
-                        entry = appendWorkQueue.poll(groupWaitMs, TimeUnit.MILLISECONDS);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
+                while (started.get() || !blockPollExecutor.isTerminated()) {
+                    WriteRequest req = pollWriteRequest();
+                    if (Thread.currentThread().isInterrupted()) {
                         break;
                     }
-                    if (entry != null) {
-                        writeQueuedRecord(entry);
+                    if (req != null) {
+                        processWriteRequest(req);
                     }
                     maybeFlushBatch();
                 }
             } catch (Throwable t) {
+                started.set(false);
                 LOGGER.error("file-wal write thread terminated unexpectedly", t);
             } finally {
-                // Drain anything we haven't handed off yet.
-                drainRemainingOnShutdown();
+                drainOnShutdown();
                 LOGGER.info("file-wal write thread exited");
             }
         }
 
-
-        /**
-         * Takes one {@link QueueEntry} from the append pipeline, writes its record bytes to the
-         * correct segment (no fsync yet), and folds it into the batch handed to the force-write thread.
-         */
-        private void writeQueuedRecord(QueueEntry entry) {
-            final long walOffset = entry.getWalOffset();
-            final Record record = entry.getRecord();
-            CompositeByteBuf data = null;
+        private WriteRequest pollWriteRequest() {
             try {
-                Segment segment = segmentManager.latestSegment(walOffset);
-                data = ByteBufAlloc.compositeByteBuffer();
-                data.addComponents(true, record.header(), record.body());
-                final int payloadBytes = data.readableBytes();
-                if (writeBandwidthLimiter != null) {
-                    writeBandwidthLimiter.acquire(payloadBytes);
-                }
-                final long writeStart = System.nanoTime();
-                segment.write(data);
-                StorageOperationStats.getInstance().appendWALWriteStats.record(TimerUtil.timeElapsedSince(writeStart,
-                    TimeUnit.NANOSECONDS));
+                return writeQueue.poll(groupWaitMs, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
+        }
 
-                trackRecordInOpenBatch(entry, segment, payloadBytes);
-
-                //segmentForAppend(walOffset);
-                boolean shouldClose = segment.getPosition() > segmentRollThresholdBytes;
-                if (shouldClose) {
+        private void processWriteRequest(WriteRequest req) {
+            try {
+                rollBatchOnSegmentChange(req);
+                appendToSegment(req);
+                if (req.shouldClose) {
                     flushBatchToForceWrite(true);
-                    segmentManager.rollOverSegment(walOffset + payloadBytes);
                 }
             } catch (Exception e) {
-                LOGGER.error("failed to write block, walOffset: {}", walOffset, e);
-                entry.getFuture().completeExceptionally(e);
-            } finally {
-                // Payload has been copied into the file channel; release views. Append futures are
-                // completed after fsync on the force-write thread.
-                if (data != null) {
-                    data.release();
-                }
-                HEADER_POOL.release(record.header());
+                LOGGER.error("failed to write block, walOffset: {}", req.startOffset, e);
+                FutureUtil.completeExceptionally(req.block.futures().iterator(), e);
+                req.block.release();
             }
         }
 
-        private void trackRecordInOpenBatch(QueueEntry entry, Segment segment, int payloadBytes) {
-            batchSegment = segment;
-            if (batchEntries == 0) {
-                batchStartNanos = System.nanoTime();
-                batchStartOffset    = entry.walOffset;
-            }
-            batchEndOffset = entry.getWalOffset() + payloadBytes;
-            batchBytes += payloadBytes;
-            batchEntries++;
-            batchFutures.add(entry.getFuture());
-        }
-
-        private void maybeFlushBatch() {
-            if (batchEntries == 0) {
+        private void rollBatchOnSegmentChange(WriteRequest req) {
+            if (!hasOpenBatch()) {
                 return;
             }
-
-            boolean timeout = System.nanoTime() - batchStartNanos >= TimeUnit.MILLISECONDS.toNanos(groupWaitMs);
-            boolean overBytes = batchBytes >= flushBytesThreshold;
-            boolean overEntries = batchEntries >= flushEntriesThreshold;
-            if (timeout || overBytes || overEntries) {
+            if (batchSegment != req.segment) {
+                // Keep each force-write request bound to one segment.
                 flushBatchToForceWrite(false);
             }
         }
 
+        private void appendToSegment(WriteRequest req) throws IOException {
+            ByteBuf data = req.block.data();
+            final long writeStart = System.nanoTime();
+            req.segment.write(data);
+            StorageOperationStats.getInstance().appendWALWriteStats.record(TimerUtil.timeElapsedSince(writeStart,
+                TimeUnit.NANOSECONDS));
+            trackBlockInOpenBatch(req, Math.toIntExact(req.block.size()));
+        }
+
+        private void trackBlockInOpenBatch(WriteRequest req, int payloadBytes) {
+            batchSegment = req.segment;
+            if (!hasOpenBatch()) {
+                batchStartNanos = System.nanoTime();
+                batchStartOffset = req.startOffset;
+            }
+            batchEndOffset = req.endOffset;
+            batchBytes += payloadBytes;
+            batchEntries++;
+            batchBlocks.add(req.block);
+        }
+
+        private void maybeFlushBatch() {
+            if (!hasOpenBatch()) {
+                return;
+            }
+
+            if (shouldFlushOpenBatch()) {
+                flushBatchToForceWrite(false);
+            }
+        }
+
+        private boolean shouldFlushOpenBatch() {
+            boolean timeout = System.nanoTime() - batchStartNanos >= TimeUnit.MILLISECONDS.toNanos(groupWaitMs);
+            boolean overBytes = batchBytes >= flushBytesThreshold;
+            boolean overEntries = batchEntries >= flushEntriesThreshold;
+            return timeout || overBytes || overEntries;
+        }
+
+        private boolean hasOpenBatch() {
+            return batchEntries > 0;
+        }
+
         private void flushBatchToForceWrite(boolean shouldClose) {
-            if (batchEntries == 0) {
+            if (!hasOpenBatch()) {
                 return;
             }
             ForceWriteRequest req = new ForceWriteRequest(batchSegment, batchStartOffset, batchEndOffset,
-                new ArrayList<>(batchFutures), shouldClose);
+                new ArrayList<>(batchBlocks), shouldClose);
             try {
-                pendingFsyncQueue.put(req);
+                forceQueue.put(req);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                FutureUtil.completeExceptionally(req.futures.iterator(), new WALShutdownException("interrupted while "
-                    + "enqueuing force-write request"));
+                WALShutdownException ex = new WALShutdownException("interrupted while enqueuing force-write request");
+                for (Block block : req.blocks) {
+                    FutureUtil.completeExceptionally(block.futures().iterator(), ex);
+                    block.release();
+                }
             }
-            batchFutures.clear();
+            resetOpenBatch();
+        }
+
+        private void resetOpenBatch() {
+            batchBlocks.clear();
             batchSegment = null;
             batchStartOffset = -1;
             batchEndOffset = -1;
@@ -894,29 +971,27 @@ public class FilesystemWALService implements WriteAheadLog {
             batchStartNanos = 0;
         }
 
-        private void drainRemainingOnShutdown() {
-            // Pick up any queue entries still waiting so callers don't hang.
+        private void drainOnShutdown() {
             while (true) {
-                QueueEntry entry = appendWorkQueue.poll();
-                if (entry == null) {
+                WriteRequest req = writeQueue.poll();
+                if (req == null) {
                     break;
                 }
-                writeQueuedRecord(entry);
+                processWriteRequest(req);
             }
-            flushBatchToForceWrite(true);
+            flushBatchToForceWrite(false);
         }
     }
 
     /**
      * Single-threaded force-write stage: groups requests, fsyncs each distinct segment exactly
-     * once per batch, completes pending futures and advises the kernel to drop the corresponding
-     * page cache range.
+     * once per batch, completes pending futures and releases the associated buffers.
      * <p>
      * The loop continues while {@code started} is true <em>or</em> while {@link #writeExecutor} is still
-     * running.  This is necessary because {@link WriteLoop#drainRemainingOnShutdown()} pushes a
-     * final batch to {@code pendingFsyncQueue} after {@code started} is set to {@code false}; if
-     * this loop exited as soon as {@code started} became false it would miss that final batch and
-     * leave the associated futures unresolved.  Once {@link #writeExecutor} has terminated no new items
+     * running.  This is necessary because {@code WriteLoop#drainOnShutdown()} pushes a final
+     * batch to {@code forceQueue} after {@code started} is set to {@code false}; if this loop
+     * exited as soon as {@code started} became false it would miss that final batch and leave
+     * the associated futures unresolved.  Once {@link #writeExecutor} has terminated no new items
      * can be added, so a final non-blocking drain in the {@code finally} block catches anything
      * that arrived in the window between the last timed poll and the loop exit.
      */
@@ -925,12 +1000,11 @@ public class FilesystemWALService implements WriteAheadLog {
         @Override
         public void run() {
             LOGGER.info("file-wal force-write thread started");
-            @SuppressWarnings("unchecked") ForceWriteRequest[] batch =
-                new ForceWriteRequest[FSYNC_COALESCE_BUFFER_CAPACITY];
+            ForceWriteRequest[] batch = new ForceWriteRequest[FSYNC_COALESCE_BUFFER_CAPACITY];
             try {
                 while (started.get() || !writeExecutor.isTerminated()) {
                     try {
-                        int count = pendingFsyncQueue.pollAll(batch, groupWaitMs, TimeUnit.MILLISECONDS);
+                        int count = forceQueue.pollAll(batch, groupWaitMs, TimeUnit.MILLISECONDS);
                         if (count == 0) {
                             continue;
                         }
@@ -946,19 +1020,19 @@ public class FilesystemWALService implements WriteAheadLog {
                     }
                 }
             } finally {
-                // Drain any items deposited by WriteLoop.drainRemainingOnShutdown() after the main
-                // loop exited. writeExecutor has terminated (or we broke out on error) so no further
+                // Drain any items deposited by WriteLoop.drainOnShutdown() after the main loop
+                // exited. writeExecutor has terminated (or we broke out on error) so no further
                 // items can be added.
-                drainRemainingOnShutdown(batch);
+                drainOnShutdown(batch);
                 LOGGER.info("file-wal force-write thread exited");
             }
         }
 
-        private void drainRemainingOnShutdown(ForceWriteRequest[] batch) {
+        private void drainOnShutdown(ForceWriteRequest[] batch) {
             while (true) {
                 int count = 0;
                 ForceWriteRequest req;
-                while (count < batch.length && (req = pendingFsyncQueue.poll()) != null) {
+                while (count < batch.length && (req = forceQueue.poll()) != null) {
                     batch[count++] = req;
                 }
                 if (count == 0) {
@@ -973,18 +1047,33 @@ public class FilesystemWALService implements WriteAheadLog {
             Arrays.stream(batch, 0, count).collect(Collectors.groupingBy(r -> r.segment)).forEach((segment, requests) -> {
                 ForceWriteRequest first = requests.get(0);
                 ForceWriteRequest last = requests.get(requests.size() - 1);
+                boolean closeSegment = requests.stream().anyMatch(r -> r.shouldClose);
                 try {
                     segment.fsync();
                     // Capture the durable end offset at the moment of the fsync so that
                     // flushedOffset() always returns a stable, already-synced value.
                     flushedMarkOffset.set(last.endOffset);
-                    requests.forEach(r -> {
-                        r.process();
-                        r.futures.forEach(f -> f.complete(() -> first.startOffset));
-                    });
+                    final long callbackOffset = first.startOffset;
+                    for (ForceWriteRequest req : requests) {
+                        for (Block block : req.blocks) {
+                            for (CompletableFuture<AppendResult.CallbackResult> f : block.futures()) {
+                                f.complete(() -> callbackOffset);
+                            }
+                            block.release();
+                        }
+                    }
                 } catch (Throwable t) {
-                    requests.forEach(r -> r.futures.forEach(f -> f.completeExceptionally(t)));
+                    for (ForceWriteRequest req : requests) {
+                        for (Block block : req.blocks) {
+                            FutureUtil.completeExceptionally(block.futures().iterator(), t);
+                            block.release();
+                        }
+                    }
                     LOGGER.error("unexpected error in force-write thread", t);
+                } finally {
+                    if (closeSegment) {
+                        segment.close();
+                    }
                 }
             });
         }

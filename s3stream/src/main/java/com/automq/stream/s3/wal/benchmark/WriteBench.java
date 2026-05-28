@@ -83,9 +83,6 @@ public class WriteBench implements AutoCloseable {
                 if (config.segmentRollThresholdBytes != null) {
                     fsBuilder.segmentRollThresholdBytes(config.segmentRollThresholdBytes);
                 }
-                if (config.writeBuffer != null) {
-                    fsBuilder.writeBufferCapacity(config.writeBuffer);
-                }
                 if (config.fsGroupWaitMs != null) {
                     fsBuilder.groupWaitMs(config.fsGroupWaitMs);
                 }
@@ -94,6 +91,12 @@ public class WriteBench implements AutoCloseable {
                 }
                 if (config.fsFlushEntries != null) {
                     fsBuilder.flushEntriesThreshold(config.fsFlushEntries);
+                }
+                if (config.fsBlockMaxSize != null) {
+                    fsBuilder.blockMaxSize(config.fsBlockMaxSize);
+                }
+                if (config.fsBlockSoftLimit != null) {
+                    fsBuilder.blockSoftLimit(config.fsBlockSoftLimit);
                 }
                 if (config.bandwidth != null) {
                     fsBuilder.writeBandwidthLimit(config.bandwidth);
@@ -243,10 +246,11 @@ public class WriteBench implements AutoCloseable {
         final String path;
         final Long capacity;
         final Long segmentRollThresholdBytes;
-        final Integer writeBuffer;
         final Long fsGroupWaitMs;
         final Long fsFlushBytes;
         final Integer fsFlushEntries;
+        final Long fsBlockMaxSize;
+        final Long fsBlockSoftLimit;
         final Integer depth;
         final Integer iops;
         final Long bandwidth;
@@ -262,10 +266,11 @@ public class WriteBench implements AutoCloseable {
             this.path = ns.getString("path");
             this.capacity = ns.getLong("capacity");
             this.segmentRollThresholdBytes = ns.getLong("segmentRollBytes");
-            this.writeBuffer = ns.getInt("writeBuffer");
             this.fsGroupWaitMs = ns.getLong("fsGroupWaitMs");
             this.fsFlushBytes = ns.getLong("fsFlushBytes");
             this.fsFlushEntries = ns.getInt("fsFlushEntries");
+            this.fsBlockMaxSize = ns.getLong("fsBlockMaxSize");
+            this.fsBlockSoftLimit = ns.getLong("fsBlockSoftLimit");
             this.depth = ns.getInt("depth");
             this.iops = ns.getInt("iops");
             this.bandwidth = ns.getLong("bandwidth");
@@ -295,10 +300,6 @@ public class WriteBench implements AutoCloseable {
                 .dest("segmentRollBytes")
                 .type(Long.class)
                 .help("Filesystem WAL only: roll to a new segment after this many record bytes per file (default: implementation default, typically 1 GiB)");
-            parser.addArgument("--segment-write-buffer-bytes")
-                .dest("segmentWriteBufferBytes")
-                .type(Integer.class)
-                .help("Filesystem WAL only: per-segment write buffer capacity in bytes (BufferedChannel)");
             parser.addArgument("--fs-group-wait-ms")
                 .dest("fsGroupWaitMs")
                 .type(Long.class)
@@ -311,6 +312,14 @@ public class WriteBench implements AutoCloseable {
                 .dest("fsFlushEntries")
                 .type(Integer.class)
                 .help("Filesystem WAL only: flush when pending batch reaches this many entries");
+            parser.addArgument("--fs-block-max-size")
+                .dest("fsBlockMaxSize")
+                .type(Long.class)
+                .help("Filesystem WAL only: hard size limit (bytes) of the in-memory append block");
+            parser.addArgument("--fs-block-soft-limit")
+                .dest("fsBlockSoftLimit")
+                .type(Long.class)
+                .help("Filesystem WAL only: soft size limit (bytes) of the in-memory append block");
             parser.addArgument("-d", "--depth")
                 .type(Integer.class)
                 .help("IO depth of the WAL");

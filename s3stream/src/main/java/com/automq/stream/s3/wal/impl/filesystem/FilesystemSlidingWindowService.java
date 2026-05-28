@@ -151,7 +151,7 @@ public class FilesystemSlidingWindowService {
 
     /**
      * Reset the pipeline so that the next block starts at {@code startOffset}. All in-flight
-     * data is released and pending blocks are dropped; intended for {@link #reset()}-style flows
+     * data is released and pending blocks are dropped; intended for reset-style flows
      * where any not-yet-durable data has been logically discarded by the caller.
      */
     public void resetTo(long startOffset) {
