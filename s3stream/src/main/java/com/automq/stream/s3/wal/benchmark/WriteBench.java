@@ -191,7 +191,7 @@ public class WriteBench implements AutoCloseable {
         byte[] bytes = new byte[config.recordSizeBytes];
         random.nextBytes(bytes);
         ByteBuf payload = Unpooled.wrappedBuffer(bytes).retain();
-        int intervalNanos = (int) TimeUnit.SECONDS.toNanos(1) / Math.max(1, config.throughputBytes / config.recordSizeBytes);
+        long intervalNanos = TimeUnit.SECONDS.toNanos(1) / Math.max(1L, config.throughputBytes / config.recordSizeBytes);
         long lastAppendTimeNanos = System.nanoTime();
         long taskStartTimeMillis = System.currentTimeMillis();
 
@@ -257,7 +257,7 @@ public class WriteBench implements AutoCloseable {
 
         // following fields are benchmark configuration
         final Integer threads;
-        final Integer throughputBytes;
+        final Long throughputBytes;
         final Integer recordSizeBytes;
         final Long durationSeconds;
 
@@ -275,7 +275,7 @@ public class WriteBench implements AutoCloseable {
             this.iops = ns.getInt("iops");
             this.bandwidth = ns.getLong("bandwidth");
             this.threads = ns.getInt("threads");
-            this.throughputBytes = ns.getInt("throughput");
+            this.throughputBytes = ns.getLong("throughput");
             this.recordSizeBytes = ns.getInt("recordSize");
             this.durationSeconds = ns.getLong("duration");
         }
@@ -334,8 +334,8 @@ public class WriteBench implements AutoCloseable {
                 .setDefault(1)
                 .help("Number of threads to use to write");
             parser.addArgument("-t", "--throughput")
-                .type(Integer.class)
-                .setDefault(1 << 20)
+                .type(Long.class)
+                .setDefault(1L << 20)
                 .help("Expected throughput in total in bytes per second");
             parser.addArgument("-s", "--record-size")
                 .dest("recordSize")
@@ -351,7 +351,7 @@ public class WriteBench implements AutoCloseable {
     }
 
     static class AppendTaskConfig {
-        final int throughputBytes;
+        final long throughputBytes;
         final int recordSizeBytes;
         final long durationSeconds;
 
