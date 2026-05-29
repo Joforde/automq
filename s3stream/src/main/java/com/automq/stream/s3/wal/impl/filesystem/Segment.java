@@ -19,6 +19,7 @@
 
 package com.automq.stream.s3.wal.impl.filesystem;
 
+import com.automq.stream.s3.ByteBufAlloc;
 import io.netty.buffer.ByteBuf;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -40,16 +41,29 @@ import java.nio.channels.FileChannel;
 public class Segment {
     private static final Logger LOGGER = LoggerFactory.getLogger(Segment.class);
 
+    /**
+     * Capacity of the in-memory merge buffer. Small {@link #write(ByteBuf)} calls are copied into
+     * this buffer and flushed to the channel in a single, larger {@link FileChannel#write}, which
+     * avoids the poor performance of issuing one syscall per small record.
+     */
+    private static final int WRITE_BUFFER_CAPACITY = 1 << 20;
+
     private final long startWalOffset;
     private final File file;
     private RandomAccessFile raf;
     private FileChannel fileChannel;
     /**
-     * Next byte position to write in this file (0-based). Mutated only by the single WAL write
-     * thread, so no synchronization is required for the writer; readers use
-     * {@link FileChannel#read(ByteBuffer, long)} which is unaffected by the channel position.
+     * Logical end position of this file (0-based), i.e. the number of bytes that have been handed
+     * to {@link #write(ByteBuf)}, including bytes still sitting in {@link #writeBuffer} that have
+     * not yet been pushed to the channel. Mutated only by the single WAL write thread.
      */
     private long writePosition;
+    /**
+     * In-memory buffer that merges consecutive small writes before they are flushed to the channel.
+     * Incoming records are copied here and only written out once the buffer fills up or an explicit
+     * {@link #flush()} / {@link #fsync()} happens.
+     */
+    private final ByteBuf writeBuffer;
     /**
      * Next byte position to read in this file (0-based), for sequential reads.
      */
@@ -72,6 +86,9 @@ public class Segment {
         this.raf = new RandomAccessFile(file, "rw");
         this.fileChannel = raf.getChannel();
         this.writePosition = raf.length();
+        // Position the channel at the end of the file so buffered data is appended on flush.
+        this.fileChannel.position(this.writePosition);
+        this.writeBuffer = ByteBufAlloc.byteBuffer(WRITE_BUFFER_CAPACITY);
     }
 
     /**
@@ -124,6 +141,7 @@ public class Segment {
             return;
         }
         closed = true;
+        writeBuffer.release();
         try {
             if (fileChannel != null) {
                 fileChannel.close();
@@ -160,24 +178,41 @@ public class Segment {
         if (closed) {
             throw new IOException("segment already closed: " + file);
         }
-        int total = src.readableBytes();
-        if (total <= 0) {
+        int len = src.readableBytes();
+        if (len <= 0) {
             return;
         }
-        ByteBuffer[] buffers = src.nioBuffers();
-        long position = writePosition;
-        long written = 0;
-        // Use positional pwrite calls so writes are independent of the channel position.
-        for (ByteBuffer buffer : buffers) {
-            while (buffer.hasRemaining()) {
-                int n = fileChannel.write(buffer, position + written);
-                if (n < 0) {
-                    throw new IOException("write returned " + n + " on " + file);
-                }
-                written += n;
+        int copied = 0;
+        while (copied < len) {
+            int bytesToCopy = Math.min(len - copied, writeBuffer.writableBytes());
+            // Absolute-index copy so the caller's reader index is left untouched.
+            writeBuffer.writeBytes(src, src.readerIndex() + copied, bytesToCopy);
+            copied += bytesToCopy;
+            // Flush eagerly when the merge buffer is full so it never grows past its capacity.
+            if (!writeBuffer.isWritable()) {
+                flush();
             }
         }
-        writePosition = position + written;
+        flush();
+        writePosition += copied;
+    }
+
+    /**
+     * Push any data buffered in {@link #writeBuffer} to the underlying channel. The data is appended
+     * at the current channel position; it is not durable until {@link #fsync()} is called.
+     */
+    public synchronized void flush() throws IOException {
+        if (writeBuffer.writerIndex() == 0) {
+            return;
+        }
+        ByteBuffer toWrite = writeBuffer.internalNioBuffer(0, writeBuffer.writerIndex());
+        while (toWrite.hasRemaining()) {
+            int n = fileChannel.write(toWrite);
+            if (n < 0) {
+                throw new IOException("write returned " + n + " on " + file);
+            }
+        }
+        writeBuffer.clear();
     }
 
     /**
@@ -200,6 +235,8 @@ public class Segment {
         if (closed) {
             throw new IOException("segment already closed: " + file);
         }
+        // Ensure buffered-but-not-yet-flushed bytes are visible to positional reads.
+        flush();
         long position = positionForOffset(walLogicalOffset);
         int toRead = Math.min(length, dst.writableBytes());
         if (toRead <= 0) {
@@ -227,6 +264,8 @@ public class Segment {
         if (closed) {
             throw new IOException("segment already closed: " + file);
         }
+        // Flush merged writes before forcing so the durability point reflects all appended data.
+        flush();
         fileChannel.force(false);
     }
 

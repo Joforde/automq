@@ -20,6 +20,7 @@
 package com.automq.stream.s3.wal.impl.filesystem;
 
 import com.automq.stream.s3.wal.AppendResult;
+import com.automq.stream.s3.wal.exception.OverCapacityException;
 import com.automq.stream.s3.wal.impl.block.Block;
 import com.automq.stream.s3.wal.util.WALUtil;
 import io.netty.buffer.ByteBuf;
@@ -55,6 +56,8 @@ class FilesystemSlidingWindowServiceTest {
             offset1 = addRecord(block, 100, future1);
             Block next = service.sealAndNewBlockLocked(block);
             offset2 = addRecord(next, 200, future2);
+        } catch (OverCapacityException e) {
+            throw new RuntimeException(e);
         } finally {
             lock.unlock();
         }
@@ -120,6 +123,8 @@ class FilesystemSlidingWindowServiceTest {
             addRecord(current, 64, pendingFuture);
             Block next = service.sealAndNewBlockLocked(current);
             addRecord(next, 64, currentFuture);
+        } catch (OverCapacityException e) {
+            throw new RuntimeException(e);
         } finally {
             lock.unlock();
         }

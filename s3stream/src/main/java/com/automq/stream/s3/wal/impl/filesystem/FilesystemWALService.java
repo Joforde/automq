@@ -484,6 +484,8 @@ public class FilesystemWALService implements WriteAheadLog {
             recordOffset = block.addRecord(recordSize, supplier, appendResultFuture);
             if (recordOffset < 0) {
                 // current block is full - seal it and start a new one
+                // This may throw OverCapacityException if the pending blocks queue is full,
+                // providing back-pressure to the caller.
                 block = slidingWindowService.sealAndNewBlockLocked(block);
                 recordOffset = block.addRecord(recordSize, supplier, appendResultFuture);
             }
@@ -589,9 +591,9 @@ public class FilesystemWALService implements WriteAheadLog {
         // Max write throughput in bytes/s. Long.MAX_VALUE means unlimited.
         private long writeBandwidthLimit = Long.MAX_VALUE;
         // Max bytes per in-memory block before a new block is created.
-        private long blockMaxSize = 10L << 20; // 10 MiB
+        private long blockMaxSize = 20L << 20; // 20 MiB
         // Soft size limit per block (block can exceed it only with a single oversized record).
-        private long blockSoftLimit = 256L << 10; // 256 KiB
+        private long blockSoftLimit = 4L << 20;  // 4 MiB
         // wal io request limit
         private int writeRateLimit = 3000;
         private int fsyncRateLimit = 100;

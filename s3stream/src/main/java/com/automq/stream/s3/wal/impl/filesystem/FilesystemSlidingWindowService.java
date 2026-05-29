@@ -20,12 +20,16 @@
 package com.automq.stream.s3.wal.impl.filesystem;
 
 import com.automq.stream.s3.wal.AppendResult;
+import com.automq.stream.s3.wal.common.BatchedBlockingQueue;
+import com.automq.stream.s3.wal.common.BlockingMpscQueue;
+import com.automq.stream.s3.wal.exception.OverCapacityException;
 import com.automq.stream.s3.wal.impl.block.Block;
 import com.automq.stream.s3.wal.impl.block.BlockImpl;
+
 import java.util.Collection;
 import java.util.LinkedList;
-import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -43,11 +47,16 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 public class FilesystemSlidingWindowService {
 
+    /**
+     * Default capacity of the pending blocks queue.
+     */
+    private static final int DEFAULT_PENDING_BLOCKS_CAPACITY = 1000;
+
     private final long blockMaxSize;
     private final long blockSoftLimit;
 
     private final Lock blockLock = new ReentrantLock();
-    private final Queue<Block> pendingBlocks = new LinkedList<>();
+    private final BatchedBlockingQueue<Block> pendingBlocks;
 
     private volatile Block currentBlock;
     /**
@@ -56,15 +65,22 @@ public class FilesystemSlidingWindowService {
     private long nextStartOffset;
 
     public FilesystemSlidingWindowService(long blockMaxSize, long blockSoftLimit) {
+        this(blockMaxSize, blockSoftLimit, DEFAULT_PENDING_BLOCKS_CAPACITY);
+    }
+
+    public FilesystemSlidingWindowService(long blockMaxSize, long blockSoftLimit, int pendingBlocksCapacity) {
         if (blockMaxSize <= 0) {
             throw new IllegalArgumentException("blockMaxSize must be positive: " + blockMaxSize);
         }
         if (blockSoftLimit <= 0 || blockSoftLimit > blockMaxSize) {
-            throw new IllegalArgumentException("invalid blockSoftLimit: " + blockSoftLimit
-                + ", blockMaxSize: " + blockMaxSize);
+            throw new IllegalArgumentException("invalid blockSoftLimit: " + blockSoftLimit + ", blockMaxSize: " + blockMaxSize);
+        }
+        if (pendingBlocksCapacity <= 0) {
+            throw new IllegalArgumentException("pendingBlocksCapacity must be positive: " + pendingBlocksCapacity);
         }
         this.blockMaxSize = blockMaxSize;
         this.blockSoftLimit = blockSoftLimit;
+        this.pendingBlocks = new BlockingMpscQueue<>(pendingBlocksCapacity);
     }
 
     /**
@@ -93,12 +109,23 @@ public class FilesystemSlidingWindowService {
      * starting immediately after the previous one.
      * <p>
      * Note: this method is NOT thread-safe; the caller must hold {@link #blockLock}.
+     *
+     * @throws OverCapacityException if the pending blocks queue is full, providing back-pressure
+     *                               to the caller.
      */
-    public Block sealAndNewBlockLocked(Block previousBlock) {
+    public Block sealAndNewBlockLocked(Block previousBlock) throws OverCapacityException {
         long newStart = previousBlock.startOffset() + previousBlock.size();
         Block newBlock = newBlock(newStart);
         if (!previousBlock.isEmpty()) {
-            pendingBlocks.add(previousBlock);
+            try {
+                if (!pendingBlocks.offer(previousBlock, 10, TimeUnit.MILLISECONDS)) {
+                    // Queue is full - release the new block and signal back-pressure.
+                    newBlock.release();
+                    throw new OverCapacityException("WAL pending blocks queue is full (capacity=" + (pendingBlocks.size() + pendingBlocks.remainingCapacity()) + ")");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         } else {
             previousBlock.release();
         }

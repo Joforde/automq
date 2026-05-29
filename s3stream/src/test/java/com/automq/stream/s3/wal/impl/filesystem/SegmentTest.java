@@ -40,6 +40,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class SegmentTest {
 
     @Test
+    void testCreateSegmentPerformance() throws IOException {
+        long start = System.currentTimeMillis();
+        for (int i = 0; i < 100; i++) {
+            new Segment(new File("/tmp/t" + i), i);
+        }
+        long end = System.currentTimeMillis();
+        System.out.println(end - start);
+    }
+
+    @Test
     void appendAndReadBack() throws IOException {
         String path = TestUtils.tempFilePath();
         File file = new File(path);
