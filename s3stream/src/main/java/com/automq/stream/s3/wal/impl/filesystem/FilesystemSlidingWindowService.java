@@ -22,7 +22,6 @@ package com.automq.stream.s3.wal.impl.filesystem;
 import com.automq.stream.s3.wal.AppendResult;
 import com.automq.stream.s3.wal.impl.block.Block;
 import com.automq.stream.s3.wal.impl.block.BlockImpl;
-
 import java.util.Collection;
 import java.util.LinkedList;
 import java.util.Queue;

@@ -242,8 +242,4 @@ public class Segment {
     public String toString() {
         return "Segment{startOffset=" + startWalOffset + ", file=" + file + '}';
     }
-
-    public synchronized long getPosition() {
-        return writePosition;
-    }
 }
