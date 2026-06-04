@@ -193,7 +193,6 @@ public class Segment {
                 flush();
             }
         }
-        flush();
         writePosition += copied;
     }
 

@@ -50,7 +50,7 @@ public class FilesystemSlidingWindowService {
     /**
      * Default capacity of the pending blocks queue.
      */
-    private static final int DEFAULT_PENDING_BLOCKS_CAPACITY = 1000;
+    private static final int DEFAULT_PENDING_BLOCKS_CAPACITY = 10;
 
     private final long blockMaxSize;
     private final long blockSoftLimit;
@@ -90,6 +90,13 @@ public class FilesystemSlidingWindowService {
      */
     public Lock getBlockLock() {
         return blockLock;
+    }
+
+    /**
+     * Approximate number of sealed blocks waiting for the block-poll thread.
+     */
+    public int pendingBlocksQueueSize() {
+        return pendingBlocks.size();
     }
 
     /**
