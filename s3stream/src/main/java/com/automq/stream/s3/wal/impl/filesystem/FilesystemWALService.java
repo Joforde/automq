@@ -171,6 +171,19 @@ public class FilesystemWALService implements WriteAheadLog {
     private FilesystemWALService() {
         forceQueue = new BlockingMpscQueue<>(DEFAULT_PIPELINE_QUEUE_CAPACITY);
     }
+    protected FilesystemWALService(FilesystemWALService.FilesystemWALServiceBuilder builder) {
+        this();
+        FilesystemWALService that = builder.build();
+        this.slidingWindowService = that.slidingWindowService;
+        this.walHeader = that.walHeader;
+        this.recoveryMode = that.recoveryMode;
+        this.nodeId = that.nodeId;
+        this.epoch = that.epoch;
+        this.walMetadataFile = that.walMetadataFile;
+        this.writeRateLimit = that.writeRateLimit;
+        this.writeBandwidthLimit = that.writeBandwidthLimit;
+        this.segmentManager = that.segmentManager;
+    }
 
     public static FilesystemWALServiceBuilder builder(String path) {
         return new FilesystemWALServiceBuilder(path);
@@ -362,7 +375,7 @@ public class FilesystemWALService implements WriteAheadLog {
         return new FilesystemWALHeader(fileStartOffset);
     }
 
-    private FilesystemWALHeader tryReadLatestHeader() throws IOException {
+    public FilesystemWALHeader tryReadLatestHeader() throws IOException {
         return walMetadataFile.readLatestHeader();
     }
 
@@ -518,7 +531,7 @@ public class FilesystemWALService implements WriteAheadLog {
         long current = walHeader.getTrimOffset();
         long highestEnd = segmentManager.highestKnownEndOffset();
         long newStartOffset = Math.max(current + 1, highestEnd);
-        CompletableFuture<Void> cf = trim(newStartOffset - 1, true).thenRun(() -> {
+        CompletableFuture<Void> cf = trim(newStartOffset, true).thenRun(() -> {
             slidingWindowService.resetTo(newStartOffset);
             segmentManager.clearCurrentSegment();
             resetFinished.set(true);
@@ -1059,13 +1072,22 @@ public class FilesystemWALService implements WriteAheadLog {
                     next = recoverResult;
                     return true;
                 } catch (ReadRecordException e) {
-                    if (!firstInvalidSeen && WALUtil.isAligned(nextRecoverOffset)) {
+                    if (!firstInvalidSeen) {
                         firstInvalidSeen = true;
                         firstInvalidOffset = nextRecoverOffset;
                         LOGGER.info("first invalid offset met during recovery, offset {}, detail: '{}'",
                             firstInvalidOffset, e.getMessage());
                     }
-                    nextRecoverOffset = e.getJumpNextRecoverOffset();
+                    // FilesystemWAL stores records sequentially with no block-alignment gaps.
+                    // A read failure means the rest of the current segment is invalid (the write
+                    // was interrupted). Jump directly to the next segment's start offset; the
+                    // block-aligned jump used by BlockWAL is incorrect here and would skip valid
+                    // records packed at the beginning of the next segment.
+                    Segment nextSeg = segmentManager.nextSegmentAfter(nextRecoverOffset);
+                    if (nextSeg == null) {
+                        return false;
+                    }
+                    nextRecoverOffset = nextSeg.startOffset();
                 } catch (IOException e) {
                     LOGGER.error("failed to read record at offset {}", nextRecoverOffset, e);
                     throw new RuntimeIOException(e);
@@ -1075,13 +1097,12 @@ public class FilesystemWALService implements WriteAheadLog {
         }
 
         private boolean shouldContinue() {
-            if (!firstInvalidSeen) {
-                return segmentManager.segmentForOffset(nextRecoverOffset) != null || segmentManager.nextSegmentAfter(nextRecoverOffset) != null;
-            }
-            // After the first invalid record we still look a little further to tolerate scattered
-            // bad records, but stop once we have walked past the window.
-            long slack = 1 << 22;
-            return nextRecoverOffset < (lastValidOffset >= 0 ? lastValidOffset : firstInvalidOffset) + slack;
+            // FilesystemWAL stores records in rolling segment files with no circular wrap-around.
+            // Continue recovery as long as there are segments to read; the BlockWAL-style slack
+            // window does not apply here because valid records in a later segment must not be
+            // silently skipped just because it starts far from the first invalid offset.
+            return segmentManager.segmentForOffset(nextRecoverOffset) != null
+                || segmentManager.nextSegmentAfter(nextRecoverOffset) != null;
         }
     }
 

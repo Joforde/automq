@@ -265,7 +265,7 @@ public class Segment {
         }
         // Flush merged writes before forcing so the durability point reflects all appended data.
         flush();
-        fileChannel.force(false);
+        fileChannel.force(true);
     }
 
     public boolean containsOffset(long walLogicalOffset) {
