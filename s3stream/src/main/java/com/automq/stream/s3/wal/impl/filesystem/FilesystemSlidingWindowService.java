@@ -20,8 +20,8 @@
 package com.automq.stream.s3.wal.impl.filesystem;
 
 import com.automq.stream.s3.wal.AppendResult;
+import com.automq.stream.s3.wal.common.BatchedArrayBlockingQueue;
 import com.automq.stream.s3.wal.common.BatchedBlockingQueue;
-import com.automq.stream.s3.wal.common.BlockingMpscQueue;
 import com.automq.stream.s3.wal.exception.OverCapacityException;
 import com.automq.stream.s3.wal.impl.block.Block;
 import com.automq.stream.s3.wal.impl.block.BlockImpl;
@@ -80,7 +80,7 @@ public class FilesystemSlidingWindowService {
         }
         this.blockMaxSize = blockMaxSize;
         this.blockSoftLimit = blockSoftLimit;
-        this.pendingBlocks = new BlockingMpscQueue<>(pendingBlocksCapacity);
+        this.pendingBlocks = new BatchedArrayBlockingQueue<>(pendingBlocksCapacity);
     }
 
     /**
@@ -190,8 +190,18 @@ public class FilesystemSlidingWindowService {
     public void resetTo(long startOffset) {
         blockLock.lock();
         try {
-            for (Block b : pendingBlocks) {
-                b.release();
+            int size = pendingBlocks.size();
+            if (size != 0) {
+                Block[] blocks = new BlockImpl[size];
+                try {
+                    pendingBlocks.takeAll(blocks);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException(e);
+                }
+                for (Block b : blocks) {
+                    b.release();
+                }
             }
             pendingBlocks.clear();
             if (currentBlock != null) {
@@ -212,9 +222,19 @@ public class FilesystemSlidingWindowService {
         Collection<CompletableFuture<AppendResult.CallbackResult>> futures = new LinkedList<>();
         blockLock.lock();
         try {
-            for (Block block : pendingBlocks) {
-                futures.addAll(block.futures());
-                block.release();
+            int size = pendingBlocks.size();
+            if (size != 0) {
+                Block[] blocks = new Block[size];
+                try {
+                    pendingBlocks.takeAll(blocks);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException(e);
+                }
+                for (Block block : blocks) {
+                    futures.addAll(block.futures());
+                    block.release();
+                }
             }
             pendingBlocks.clear();
             if (currentBlock != null && !currentBlock.isEmpty()) {

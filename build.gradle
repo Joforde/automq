@@ -2104,6 +2104,7 @@ project(':s3stream') {
   }
 
   dependencies {
+    implementation project(':clients')
     implementation libs.awsSdk
     implementation libs.awsSdkNetty
     // In gradle, we need to specify the classifier for netty-tcnative

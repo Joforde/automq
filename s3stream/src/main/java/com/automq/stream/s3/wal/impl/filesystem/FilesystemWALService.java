@@ -31,7 +31,7 @@ import com.automq.stream.s3.wal.RecoverResult;
 import com.automq.stream.s3.wal.WriteAheadLog;
 import com.automq.stream.s3.wal.common.AppendResultImpl;
 import com.automq.stream.s3.wal.common.BatchedBlockingQueue;
-import com.automq.stream.s3.wal.common.BlockingMpscQueue;
+import com.automq.stream.s3.wal.common.BatchedArrayBlockingQueue;
 import com.automq.stream.s3.wal.common.RecordHeader;
 import com.automq.stream.s3.wal.common.RecoverResultImpl;
 import com.automq.stream.s3.wal.common.ShutdownType;
@@ -169,7 +169,7 @@ public class FilesystemWALService implements WriteAheadLog {
     private Bucket fsyncRateBucket;
 
     private FilesystemWALService() {
-        forceQueue = new BlockingMpscQueue<>(DEFAULT_PIPELINE_QUEUE_CAPACITY);
+        forceQueue = new BatchedArrayBlockingQueue<>(DEFAULT_PIPELINE_QUEUE_CAPACITY);
     }
     protected FilesystemWALService(FilesystemWALService.FilesystemWALServiceBuilder builder) {
         this();
@@ -927,11 +927,9 @@ public class FilesystemWALService implements WriteAheadLog {
             try {
                 while (started.get() || !writeExecutor.isTerminated()) {
                     try {
-                        int count = forceQueue.pollAll(batch, 1, TimeUnit.MILLISECONDS);
+                        int count = forceQueue.takeAll(batch);
                         if (count != 0) {
                             processForceWriteBatch(batch, count);
-                        } else {
-                            TimeUnit.MILLISECONDS.sleep(1);
                         }
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
