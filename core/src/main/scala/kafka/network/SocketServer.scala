@@ -1167,6 +1167,7 @@ private[kafka] class Processor(
                 }
                 requestChannel.sendRequest(req)
                 selector.mute(connectionId)
+                handleChannelMuteEvent(connectionId, ChannelMuteEvent.REQUEST_RECEIVED)
               }
             }
           case None =>
