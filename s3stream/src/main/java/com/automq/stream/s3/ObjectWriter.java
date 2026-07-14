@@ -158,14 +158,15 @@ public interface ObjectWriter {
 
         private List<List<StreamRecordBatch>> groupByBlock(List<StreamRecordBatch> records) {
             List<List<StreamRecordBatch>> blocks = new LinkedList<>();
-            List<StreamRecordBatch> blockRecords = new ArrayList<>(records.size());
+            List<StreamRecordBatch> blockRecords = new ArrayList<>();
+            long blockSize = 0;
             for (StreamRecordBatch record : records) {
-                size += record.size();
+                blockSize += record.size();
                 blockRecords.add(record);
-                if (size >= blockSizeThreshold) {
+                if (blockSize >= blockSizeThreshold) {
                     blocks.add(blockRecords);
-                    blockRecords = new ArrayList<>(records.size());
-                    size = 0;
+                    blockRecords = new ArrayList<>();
+                    blockSize = 0;
                 }
             }
             if (!blockRecords.isEmpty()) {
